@@ -133,9 +133,10 @@ async def handle_interactive(request: Request):
                 values = view["state"]["values"]
                 private_metadata = json.loads(view.get("private_metadata", "{}"))
 
-                # リッチテキストからプレーンテキストを抽出
+                # リッチテキストを取得（変換しない）
                 description_rich = values["description_block"]["description_input"]["rich_text_value"]
-                description_text = _extract_plain_text_from_rich_text(description_rich)
+                # リッチテキストオブジェクトをそのまま渡す
+                description_data = description_rich
 
                 # 納期をdatetimeに変換
                 due_date_unix = values["due_date_block"]["due_date_picker"]["selected_date_time"]
@@ -145,7 +146,7 @@ async def handle_interactive(request: Request):
                     requester_slack_id=private_metadata["requester_id"],
                     assignee_slack_id=values["assignee_block"]["assignee_select"]["selected_option"]["value"],
                     title=values["title_block"]["title_input"]["value"],
-                    description=description_text,
+                    description=description_data,  # リッチテキストデータを渡す
                     due_date=due_date,
                 )
 

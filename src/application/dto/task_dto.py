@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union, Dict, Any
 from enum import Enum
 
 
@@ -9,13 +9,12 @@ class TaskStatusDto(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
 
-
 class CreateTaskRequestDto(BaseModel):
     """タスク作成リクエストDTO"""
     requester_slack_id: str = Field(..., description="依頼者のSlackユーザーID")
     assignee_slack_id: str = Field(..., description="依頼先のSlackユーザーID")
     title: str = Field(..., description="タスクタイトル")
-    description: str = Field(..., description="タスク内容")
+    description: Union[str, Dict[str, Any]] = Field(..., description="タスク内容（プレーンテキストまたはリッチテキスト）")
     due_date: datetime = Field(..., description="納期")
 
 

@@ -15,10 +15,26 @@ class SlackService:
     async def get_user_info(self, user_id: str) -> Dict[str, Any]:
         """ユーザー情報を取得"""
         try:
+            print(f"🔍 Getting user info for: {user_id}")
             response = self.client.users_info(user=user_id)
-            return response["user"]
+            user_data = response["user"]
+
+            print(f"📋 User data keys: {list(user_data.keys())}")
+
+            # プロフィール情報の詳細チェック
+            if "profile" in user_data:
+                profile = user_data["profile"]
+                print(f"👤 Profile keys: {list(profile.keys())}")
+                print(f"📧 Email in profile: {profile.get('email', 'No email')}")
+                print(f"🏢 Email (display): {profile.get('display_name', 'No display name')}")
+                print(f"🏷️ Real name: {profile.get('real_name', 'No real name')}")
+            else:
+                print("❌ No profile data found")
+
+            return user_data
         except SlackApiError as e:
-            print(f"Error getting user info: {e}")
+            print(f"❌ Error getting user info: {e}")
+            print(f"Error details: {e.response}")
             return {}
 
     async def send_approval_request(

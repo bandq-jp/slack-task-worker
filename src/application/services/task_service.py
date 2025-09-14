@@ -27,6 +27,15 @@ class TaskApplicationService:
         requester = await self.slack_service.get_user_info(dto.requester_slack_id)
         assignee = await self.slack_service.get_user_info(dto.assignee_slack_id)
 
+        print(f"🔍 Requester info: {requester}")
+        print(f"🔍 Assignee info: {assignee}")
+
+        requester_email = requester.get("profile", {}).get("email")
+        assignee_email = assignee.get("profile", {}).get("email")
+
+        print(f"📧 Requester email: {requester_email}")
+        print(f"📧 Assignee email: {assignee_email}")
+
         # タスクエンティティを作成
         task = TaskRequest(
             requester_slack_id=dto.requester_slack_id,
@@ -39,8 +48,8 @@ class TaskApplicationService:
         # 即座にNotionにタスクを保存（承認待ち状態で）
         notion_page_id = await self.notion_service.create_task(
             task=task,
-            requester_email=requester.get("profile", {}).get("email"),
-            assignee_email=assignee.get("profile", {}).get("email"),
+            requester_email=requester_email,
+            assignee_email=assignee_email,
         )
 
         if not notion_page_id:

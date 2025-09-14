@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union, Dict, Any
 from enum import Enum
 import uuid
 
@@ -18,7 +18,7 @@ class TaskRequest:
     requester_slack_id: str = ""
     assignee_slack_id: str = ""
     title: str = ""
-    description: str = ""
+    description: Union[str, Dict[str, Any]] = ""
     due_date: datetime = field(default_factory=datetime.now)
     status: TaskStatus = TaskStatus.PENDING
     rejection_reason: Optional[str] = None
