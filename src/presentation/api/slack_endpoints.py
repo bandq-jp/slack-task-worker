@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     gcs_bucket_name: str = ""
     google_application_credentials: str = ""
     gemini_api_key: str = ""
+    gemini_timeout_seconds: float = 30.0
 
     class Config:
         env_file = ".env"
@@ -40,7 +41,11 @@ task_repository = InMemoryTaskRepository()
 user_repository = InMemoryUserRepository()
 slack_service = SlackService(settings.slack_token, settings.slack_bot_token)
 notion_service = NotionService(settings.notion_token, settings.notion_database_id)
-ai_service = TaskAIService(settings.gemini_api_key) if settings.gemini_api_key else None
+ai_service = (
+    TaskAIService(settings.gemini_api_key, timeout_seconds=settings.gemini_timeout_seconds)
+    if settings.gemini_api_key
+    else None
+)
 
 task_service = TaskApplicationService(
     task_repository=task_repository,
@@ -59,8 +64,9 @@ async def handle_slash_command(request: Request):
     user_id = form.get("user_id")
 
     if command == "/task-request":
-        # タスク作成モーダルを開く
-        await slack_service.open_task_modal(trigger_id, user_id)
+        # タスク作成モーダルを開く（即時ACK + バックグラウンドで続行）
+        import asyncio
+        asyncio.create_task(slack_service.open_task_modal(trigger_id, user_id))
         return JSONResponse(content={"response_type": "ephemeral", "text": ""})
 
     return JSONResponse(
@@ -82,6 +88,9 @@ async def handle_interactive(request: Request):
         action_id = action["action_id"]
         task_id = action["value"]
         trigger_id = payload["trigger_id"]
+        view = payload.get("view", {})
+        view_id = view.get("id")
+        user_id = payload.get("user", {}).get("id", "unknown")
 
         if action_id == "approve_task":
             try:
@@ -133,8 +142,8 @@ async def handle_interactive(request: Request):
             return JSONResponse(content={})
         
         elif action_id == "ai_enhance_button":
-            # AI補完ボタンの処理
-            return await handle_ai_enhancement(payload, trigger_id)
+            # AI補完ボタンの処理: まず即時ACKし、その後非同期で更新
+            return await handle_ai_enhancement_async(payload, trigger_id, view_id, user_id)
 
     elif interaction_type == "view_submission":
         # モーダル送信の処理
@@ -262,7 +271,12 @@ def _extract_plain_text_from_rich_text(rich_text: Dict[str, Any]) -> str:
 
 
 async def handle_ai_enhancement(payload: dict, trigger_id: str) -> JSONResponse:
-    """AI補完処理"""
+    """[Deprecated] 互換用: 同期処理版（未使用）"""
+    return JSONResponse(content={"response_action": "errors", "errors": {"ai_helper_section": "Deprecated handler"}}, status_code=200)
+
+
+async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: Optional[str], user_id: str) -> JSONResponse:
+    """AI補完処理（非同期化）: 3秒以内にACKして処理中表示 → 後でviews.update"""
     try:
         if not ai_service:
             return JSONResponse(
@@ -324,7 +338,6 @@ async def handle_ai_enhancement(payload: dict, trigger_id: str) -> JSONResponse:
                 task_info.current_description = convert_rich_text_to_plain_text(current_desc)
         
         # セッションID（ユーザーID + trigger_id の一部を使用）
-        user_id = payload.get("user", {}).get("id", "unknown")
         session_id = f"{user_id}_{trigger_id[-8:]}"
         
         # セッション情報を保存（private_metadataサイズ制限対策）
@@ -332,32 +345,43 @@ async def handle_ai_enhancement(payload: dict, trigger_id: str) -> JSONResponse:
             "original_view": view,
             "user_id": user_id,
             "trigger_id": trigger_id,
-            "task_info": task_info
+            "task_info": task_info,
+            "view_id": view_id,
         }
-        
-        # AI分析を実行
-        result = ai_service.analyze_task_info(session_id, task_info)
-        
-        if result.status == "insufficient_info":
-            # 情報不足の場合 - 追加情報入力モーダルを表示
-            return await show_additional_info_modal(trigger_id, session_id, result, view)
-            
-        elif result.status == "ready_to_format":
-            # 整形済みの場合 - セッションにコンテンツを保存してから確認モーダルを表示
-            modal_sessions[session_id]["generated_content"] = result.formatted_content
-            return await show_content_confirmation_modal(trigger_id, session_id, result, view)
-            
-        else:
-            # エラーの場合
-            return JSONResponse(
-                content={
-                    "response_action": "errors",
-                    "errors": {
-                        "ai_helper_section": f"AI処理でエラーが発生しました: {result.message}"
-                    }
-                },
-                status_code=200
-            )
+
+        # 1) まず即時ACK（処理中ビューに置換）
+        processing_view = create_processing_view(session_id, title="AI補完 - 実行中", description="AIが内容を整理中です… しばらくお待ちください。")
+
+        # 非同期でGemini処理 → 結果に応じてviews.update
+        import asyncio
+
+        async def run_analysis_and_update():
+            try:
+                result = ai_service.analyze_task_info(session_id, task_info)
+                if not view_id:
+                    return
+                if result.status == "insufficient_info":
+                    new_view = create_additional_info_modal_view(session_id, result)
+                elif result.status == "ready_to_format":
+                    modal_sessions[session_id]["generated_content"] = result.formatted_content
+                    new_view = create_content_confirmation_modal_view(session_id, result)
+                else:
+                    new_view = create_error_view(session_id, f"AI処理でエラーが発生しました: {result.message}")
+
+                # private_metadata に session_id を付与
+                new_view["private_metadata"] = json.dumps({"session_id": session_id})
+                slack_service.client.views_update(view_id=view_id, view=new_view)
+            except Exception as e:
+                err_view = create_error_view(session_id, f"AI処理エラー: {str(e)}")
+                try:
+                    if view_id:
+                        slack_service.client.views_update(view_id=view_id, view=err_view)
+                except Exception:
+                    pass
+
+        asyncio.create_task(run_analysis_and_update())
+
+        return JSONResponse(content={"response_action": "update", "view": processing_view}, status_code=200)
             
     except Exception as e:
         error_msg = str(e)
@@ -387,138 +411,17 @@ async def handle_ai_enhancement(payload: dict, trigger_id: str) -> JSONResponse:
 
 
 async def show_additional_info_modal(trigger_id: str, session_id: str, result: AIAnalysisResult, original_view: dict) -> JSONResponse:
-    """追加情報入力モーダルを表示"""
-    suggestions_text = "\n".join(f"• {s}" for s in result.suggestions) if result.suggestions else ""
-    
-    additional_info_modal = {
-        "type": "modal",
-        "callback_id": "ai_additional_info_modal",
-        "title": {
-            "type": "plain_text",
-            "text": "AI補完 - 追加情報"
-        },
-        "submit": {
-            "type": "plain_text",
-            "text": "分析実行"
-        },
-        "close": {
-            "type": "plain_text", 
-            "text": "キャンセル"
-        },
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"🤖 *AI分析結果*\n{result.message}"
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*必要な追加情報:*\n{suggestions_text}"
-                }
-            },
-            {
-                "type": "input",
-                "block_id": "additional_info_block",
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "additional_info_input",
-                    "multiline": True,
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "上記の質問に対する回答を入力してください..."
-                    }
-                },
-                "label": {
-                    "type": "plain_text",
-                    "text": "追加情報"
-                }
-            }
-        ],
-        "private_metadata": json.dumps({
-            "session_id": session_id
-        })
-    }
-    
-    # views.push APIを使用してモーダルをプッシュ
-    response = slack_service.client.views_push(
-        trigger_id=trigger_id,
-        view=additional_info_modal
-    )
-    
+    """[Deprecated] 非同期化により未使用。views.update を使用してください。"""
     return JSONResponse(content={}, status_code=200)
 
 
 async def show_content_confirmation_modal(trigger_id: str, session_id: str, result: AIAnalysisResult, original_view: dict) -> JSONResponse:
-    """生成されたコンテンツの確認モーダルを表示"""
-    confirmation_modal = {
-        "type": "modal",
-        "callback_id": "ai_content_confirmation_modal", 
-        "title": {
-            "type": "plain_text",
-            "text": "AI補完 - 内容確認"
-        },
-        "submit": {
-            "type": "plain_text",
-            "text": "採用する"
-        },
-        "close": {
-            "type": "plain_text",
-            "text": "キャンセル"
-        },
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn", 
-                    "text": "🤖 *AI生成されたタスク内容*\n以下の内容でよろしければ「採用する」をクリックしてください。"
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"```{result.formatted_content}```"
-                }
-            },
-            {
-                "type": "input",
-                "block_id": "feedback_block",
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "feedback_input",
-                    "multiline": True,
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "修正点があれば入力してください（任意）"
-                    }
-                },
-                "label": {
-                    "type": "plain_text", 
-                    "text": "フィードバック（任意）"
-                },
-                "optional": True
-            }
-        ],
-        "private_metadata": json.dumps({
-            "session_id": session_id
-        })
-    }
-    
-    # views.push APIを使用
-    response = slack_service.client.views_push(
-        trigger_id=trigger_id,
-        view=confirmation_modal
-    )
-    
+    """[Deprecated] 非同期化により未使用。views.update を使用してください。"""
     return JSONResponse(content={}, status_code=200)
 
 
 async def handle_additional_info_submission(payload: dict) -> JSONResponse:
-    """追加情報入力モーダルの送信処理"""
+    """追加情報入力モーダルの送信処理（非同期化: 即時ACK→views.update）"""
     try:
         if not ai_service:
             return JSONResponse(
@@ -531,12 +434,13 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
                 status_code=200
             )
         
-        values = payload["view"]["state"]["values"]
-        private_metadata = json.loads(payload["view"].get("private_metadata", "{}"))
-        
+        view = payload.get("view", {})
+        values = view.get("state", {}).get("values", {})
+        view_id = view.get("id")
+        private_metadata = json.loads(view.get("private_metadata", "{}"))
         session_id = private_metadata.get("session_id")
-        additional_info = values["additional_info_block"]["additional_info_input"]["value"]
-        
+        additional_info = values["additional_info_block"]["additional_info_input"].get("value", "")
+
         if not additional_info.strip():
             return JSONResponse(
                 content={
@@ -547,40 +451,37 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
                 },
                 status_code=200
             )
-        
-        # AI改良を実行
-        result = ai_service.refine_content(session_id, additional_info)
-        
-        if result.status == "insufficient_info":
-            # まだ情報不足の場合
-            return JSONResponse(
-                content={
-                    "response_action": "update",
-                    "view": create_additional_info_modal_view(session_id, result)
-                },
-                status_code=200
-            )
-        elif result.status == "ready_to_format":
-            # 整形完了の場合 - セッションにコンテンツを保存してから確認モーダルに移行
-            modal_sessions[session_id]["generated_content"] = result.formatted_content
-            return JSONResponse(
-                content={
-                    "response_action": "update",
-                    "view": create_content_confirmation_modal_view(session_id, result)
-                },
-                status_code=200
-            )
-        else:
-            # エラーの場合
-            return JSONResponse(
-                content={
-                    "response_action": "errors",
-                    "errors": {
-                        "additional_info_block": f"AI処理エラー: {result.message}"
-                    }
-                },
-                status_code=200
-            )
+
+        # 即時ACK: 処理中ビュー
+        processing_view = create_processing_view(session_id, title="AI補完 - 再分析中", description="いただいた情報で再分析しています…")
+
+        # 背景でAI改良→views.update
+        import asyncio
+
+        async def run_refine_and_update():
+            try:
+                result = ai_service.refine_content(session_id, additional_info)
+                if result.status == "insufficient_info":
+                    new_view = create_additional_info_modal_view(session_id, result)
+                elif result.status == "ready_to_format":
+                    modal_sessions[session_id]["generated_content"] = result.formatted_content
+                    new_view = create_content_confirmation_modal_view(session_id, result)
+                else:
+                    new_view = create_error_view(session_id, f"AI処理エラー: {result.message}")
+                new_view["private_metadata"] = json.dumps({"session_id": session_id})
+                if view_id:
+                    slack_service.client.views_update(view_id=view_id, view=new_view)
+            except Exception as e:
+                err_view = create_error_view(session_id, f"AI処理エラー: {str(e)}")
+                try:
+                    if view_id:
+                        slack_service.client.views_update(view_id=view_id, view=err_view)
+                except Exception:
+                    pass
+
+        asyncio.create_task(run_refine_and_update())
+
+        return JSONResponse(content={"response_action": "update", "view": processing_view}, status_code=200)
             
     except Exception as e:
         error_msg = str(e)
@@ -604,10 +505,12 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
 
 
 async def handle_content_confirmation(payload: dict) -> JSONResponse:
-    """内容確認モーダルの処理"""
+    """内容確認モーダルの処理（非同期化）"""
     try:
-        values = payload["view"]["state"]["values"]
-        private_metadata = json.loads(payload["view"].get("private_metadata", "{}"))
+        view = payload.get("view", {})
+        view_id = view.get("id")
+        values = view["state"]["values"]
+        private_metadata = json.loads(view.get("private_metadata", "{}"))
         
         session_id = private_metadata.get("session_id")
         session_data = modal_sessions.get(session_id, {})
@@ -618,70 +521,59 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
         if "feedback_block" in values:
             feedback = values["feedback_block"]["feedback_input"].get("value", "").strip()
         
-        if feedback:
-            # フィードバックがある場合は改良を実行
-            if not ai_service:
-                return JSONResponse(
-                    content={
-                        "response_action": "errors",
-                        "errors": {
-                            "feedback_block": "AI機能が利用できません。"
-                        }
-                    },
-                    status_code=200
-                )
-            
-            result = ai_service.refine_content(session_id, feedback)
-            
-            # セッションに新しいコンテンツを保存
-            modal_sessions[session_id]["generated_content"] = result.formatted_content
-            
-            # 新しい確認モーダルを表示
-            return JSONResponse(
-                content={
-                    "response_action": "update",
-                    "view": create_content_confirmation_modal_view(session_id, result)
-                },
-                status_code=200
-            )
-        else:
-            # フィードバックなし - 元のモーダルに戻って内容を反映
-            original_view = session_data.get("original_view")
-            if original_view and generated_content:
-                # 元のモーダルの説明欄にAI生成内容を設定
-                if "blocks" in original_view:
-                    for block in original_view["blocks"]:
-                        if block.get("block_id") == "description_block":
-                            block["element"]["initial_value"] = {
-                                "type": "rich_text",
-                                "elements": [
-                                    {
-                                        "type": "rich_text_section",
+        # 即時ACK: 処理中ビュー
+        processing_view = create_processing_view(session_id, title="AI補完 - 反映中", description="内容を反映しています…")
+
+        import asyncio
+
+        async def run_feedback_apply():
+            try:
+                if feedback:
+                    if not ai_service:
+                        new_view = create_error_view(session_id, "AI機能が利用できません。")
+                    else:
+                        result = ai_service.refine_content(session_id, feedback)
+                        modal_sessions[session_id]["generated_content"] = result.formatted_content
+                        new_view = create_content_confirmation_modal_view(session_id, result)
+                else:
+                    # フィードバックなし - 元のモーダルに戻って内容を反映
+                    original_view = session_data.get("original_view")
+                    if original_view and generated_content:
+                        if "blocks" in original_view:
+                            for block in original_view["blocks"]:
+                                if block.get("block_id") == "description_block":
+                                    block["element"]["initial_value"] = {
+                                        "type": "rich_text",
                                         "elements": [
                                             {
-                                                "type": "text",
-                                                "text": generated_content
+                                                "type": "rich_text_section",
+                                                "elements": [
+                                                    {
+                                                        "type": "text",
+                                                        "text": generated_content
+                                                    }
+                                                ]
                                             }
                                         ]
                                     }
-                                ]
-                            }
-                            break
-                
-                return JSONResponse(
-                    content={
-                        "response_action": "update",
-                        "view": original_view
-                    },
-                    status_code=200
-                )
-            else:
-                return JSONResponse(
-                    content={
-                        "response_action": "clear"
-                    },
-                    status_code=200
-                )
+                                    break
+                        new_view = original_view
+                    else:
+                        new_view = {"type": "modal", "title": {"type": "plain_text", "text": "AI補完"}, "close": {"type": "plain_text", "text": "閉じる"}, "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "処理が完了しました。"}}]}
+
+                new_view["private_metadata"] = json.dumps({"session_id": session_id})
+                if view_id:
+                    slack_service.client.views_update(view_id=view_id, view=new_view)
+            except Exception as e:
+                try:
+                    if view_id:
+                        slack_service.client.views_update(view_id=view_id, view=create_error_view(session_id, f"処理エラー: {str(e)}"))
+                except Exception:
+                    pass
+
+        asyncio.create_task(run_feedback_apply())
+
+        return JSONResponse(content={"response_action": "update", "view": processing_view}, status_code=200)
             
     except Exception as e:
         print(f"❌ Content confirmation error: {e}")
@@ -808,4 +700,32 @@ def create_content_confirmation_modal_view(session_id: str, result: AIAnalysisRe
         "private_metadata": json.dumps({
             "session_id": session_id
         })
+    }
+
+
+def create_processing_view(session_id: str, title: str, description: str) -> dict:
+    """処理中プレースホルダービュー（即時ACK用）"""
+    return {
+        "type": "modal",
+        "callback_id": "ai_processing_modal",
+        "title": {"type": "plain_text", "text": title[:24] or "処理中"},
+        "close": {"type": "plain_text", "text": "キャンセル"},
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"⏳ {description}"}}
+        ],
+        "private_metadata": json.dumps({"session_id": session_id})
+    }
+
+
+def create_error_view(session_id: str, message: str) -> dict:
+    """エラービュー"""
+    return {
+        "type": "modal",
+        "callback_id": "ai_error_modal",
+        "title": {"type": "plain_text", "text": "エラー"},
+        "close": {"type": "plain_text", "text": "閉じる"},
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"❌ {message}"}}
+        ],
+        "private_metadata": json.dumps({"session_id": session_id})
     }

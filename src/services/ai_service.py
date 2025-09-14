@@ -66,9 +66,10 @@ class ConversationHistory:
 class TaskAIService:
     """タスクコンテンツAI拡張サービス"""
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, timeout_seconds: float = 30.0):
         self.client = genai.Client(api_key=api_key)
         self.history = ConversationHistory()
+        self.timeout_seconds = timeout_seconds
         
         # システム指示（高速化のため簡潔に）
         self.system_instruction = """タスク管理AI：提供情報から実行可能なタスクを作成
@@ -85,8 +86,9 @@ class TaskAIService:
 
 簡潔で実行可能なタスクを作成してください。"""
     
-    def _call_ai_with_timeout(self, prompt: str, timeout: float = 2.5) -> str:
+    def _call_ai_with_timeout(self, prompt: str, timeout: Optional[float] = None) -> str:
         """タイムアウト付きでAIを呼び出す"""
+        effective_timeout = timeout or self.timeout_seconds
         def call_ai():
             response = self.client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -105,7 +107,7 @@ class TaskAIService:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(call_ai)
             try:
-                return future.result(timeout=timeout)
+                return future.result(timeout=effective_timeout)
             except concurrent.futures.TimeoutError:
                 raise Exception("AI processing timeout - 処理時間が長すぎます")
     
@@ -121,8 +123,8 @@ class TaskAIService:
             # システム指示とユーザープロンプトを組み合わせ
             full_prompt = f"{self.system_instruction}\n\n{prompt}"
             
-            # タイムアウト付きでGemini APIに送信
-            response_text = self._call_ai_with_timeout(full_prompt, timeout=2.5)
+            # タイムアウト（設定値）付きでGemini APIに送信
+            response_text = self._call_ai_with_timeout(full_prompt)
             
             # レスポンスを会話履歴に追加
             self.history.add_message(session_id, "model", response_text)
@@ -154,8 +156,8 @@ class TaskAIService:
                 role_label = "ユーザー" if msg.role == "user" else "アシスタント"
                 full_context += f"{role_label}: {msg.content}\n"
             
-            # タイムアウト付きでGemini APIに送信
-            response_text = self._call_ai_with_timeout(full_context, timeout=2.5)
+            # タイムアウト（設定値）付きでGemini APIに送信
+            response_text = self._call_ai_with_timeout(full_context)
             
             # レスポンスを会話履歴に追加
             self.history.add_message(session_id, "model", response_text)

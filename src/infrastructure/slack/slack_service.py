@@ -196,72 +196,67 @@ class SlackService:
     async def open_task_modal(self, trigger_id: str, user_id: str):
         """タスク作成モーダルを開く"""
         try:
-            # ワークスペースのユーザーリストを取得
+            # まず最小のモーダルを即時に開く（3秒ルール回避）
+            loading_modal = {
+                "type": "modal",
+                "callback_id": "create_task_modal_loading",
+                "title": {"type": "plain_text", "text": "タスク依頼作成"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ 初期化中…"}}
+                ],
+                "private_metadata": json.dumps({"requester_id": user_id}),
+            }
+
+            open_resp = self.client.views_open(trigger_id=trigger_id, view=loading_modal)
+            view_id = open_resp["view"]["id"]
+
+            # ユーザーリストの取得（少し時間がかかる可能性があるため open 後に実行）
             users_response = self.client.users_list()
             users = users_response["members"]
 
             # ユーザー選択オプションを作成（社内メンバーのみ）
             user_options = []
-            # 社内メンバーの条件: ボットでない、削除されていない、ゲストでない
             internal_users = [
-                user for user in users 
-                if not user.get("is_bot") 
-                and not user.get("deleted") 
-                and not user.get("is_restricted")  # ゲストユーザーを除外
-                and not user.get("is_ultra_restricted")  # シングルチャンネルゲストを除外
+                user for user in users
+                if not user.get("is_bot")
+                and not user.get("deleted")
+                and not user.get("is_restricted")
+                and not user.get("is_ultra_restricted")
             ]
-            
-            # 最大100ユーザーに制限（Slack API制限）
+
             max_users = min(len(internal_users), 100)
             for i, user in enumerate(internal_users):
                 if i >= max_users:
                     break
                 user_options.append(
                     {
-                        "text": {
-                            "type": "plain_text",
-                            "text": user.get("real_name", user.get("name", "Unknown")),
-                        },
+                        "text": {"type": "plain_text", "text": user.get("real_name", user.get("name", "Unknown"))},
                         "value": user["id"],
                     }
                 )
-            
+
             print(f"📊 社内メンバー: {len(internal_users)}人（表示: {min(len(internal_users), 100)}人）")
             if len(internal_users) > 100:
                 print(f"⚠️ ユーザー数制限により100人のみ表示")
 
-            modal = {
+            full_modal = {
                 "type": "modal",
                 "callback_id": "create_task_modal",
-                "title": {
-                    "type": "plain_text",
-                    "text": "タスク依頼作成",
-                },
-                "submit": {
-                    "type": "plain_text",
-                    "text": "作成",
-                },
-                "close": {
-                    "type": "plain_text",
-                    "text": "キャンセル",
-                },
+                "title": {"type": "plain_text", "text": "タスク依頼作成"},
+                "submit": {"type": "plain_text", "text": "作成"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
                 "blocks": [
                     {
                         "type": "input",
                         "block_id": "assignee_block",
                         "element": {
                             "type": "static_select",
-                            "placeholder": {
-                                "type": "plain_text",
-                                "text": "依頼先を選択",
-                            },
+                            "placeholder": {"type": "plain_text", "text": "依頼先を選択"},
                             "options": user_options,
                             "action_id": "assignee_select",
                         },
-                        "label": {
-                            "type": "plain_text",
-                            "text": "依頼先",
-                        },
+                        "label": {"type": "plain_text", "text": "依頼先"},
                     },
                     {
                         "type": "input",
@@ -269,37 +264,22 @@ class SlackService:
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "title_input",
-                            "placeholder": {
-                                "type": "plain_text",
-                                "text": "タスクの件名を入力",
-                            },
+                            "placeholder": {"type": "plain_text", "text": "タスクの件名を入力"},
                         },
-                        "label": {
-                            "type": "plain_text",
-                            "text": "件名",
-                        },
+                        "label": {"type": "plain_text", "text": "件名"},
                     },
                     {
                         "type": "input",
                         "block_id": "due_date_block",
-                        "element": {
-                            "type": "datetimepicker",
-                            "action_id": "due_date_picker",
-                        },
-                        "label": {
-                            "type": "plain_text",
-                            "text": "納期",
-                        },
+                        "element": {"type": "datetimepicker", "action_id": "due_date_picker"},
+                        "label": {"type": "plain_text", "text": "納期"},
                     },
                     {
                         "type": "input",
                         "block_id": "task_type_block",
                         "element": {
                             "type": "static_select",
-                            "placeholder": {
-                                "type": "plain_text",
-                                "text": "タスク種類を選択",
-                            },
+                            "placeholder": {"type": "plain_text", "text": "タスク種類を選択"},
                             "options": [
                                 {"text": {"type": "plain_text", "text": "フリーランス関係"}, "value": "フリーランス関係"},
                                 {"text": {"type": "plain_text", "text": "モノテック関連"}, "value": "モノテック関連"},
@@ -310,20 +290,14 @@ class SlackService:
                             ],
                             "action_id": "task_type_select",
                         },
-                        "label": {
-                            "type": "plain_text",
-                            "text": "タスク種類",
-                        },
+                        "label": {"type": "plain_text", "text": "タスク種類"},
                     },
                     {
                         "type": "input",
                         "block_id": "urgency_block",
                         "element": {
                             "type": "static_select",
-                            "placeholder": {
-                                "type": "plain_text",
-                                "text": "緊急度を選択",
-                            },
+                            "placeholder": {"type": "plain_text", "text": "緊急度を選択"},
                             "options": [
                                 {"text": {"type": "plain_text", "text": "ノンコア社内タスク"}, "value": "ノンコア社内タスク"},
                                 {"text": {"type": "plain_text", "text": "1週間以内"}, "value": "1週間以内"},
@@ -331,28 +305,18 @@ class SlackService:
                             ],
                             "action_id": "urgency_select",
                         },
-                        "label": {
-                            "type": "plain_text",
-                            "text": "緊急度",
-                        },
+                        "label": {"type": "plain_text", "text": "緊急度"},
                     },
                     {
                         "type": "section",
                         "block_id": "ai_helper_section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "🤖 *AI補完機能*\nタスクの詳細内容をAIに生成・改良してもらえます"
-                        },
+                        "text": {"type": "mrkdwn", "text": "🤖 *AI補完機能*\nタスクの詳細内容をAIに生成・改良してもらえます"},
                         "accessory": {
                             "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "AI補完",
-                                "emoji": True
-                            },
+                            "text": {"type": "plain_text", "text": "AI補完", "emoji": True},
                             "value": "ai_enhance",
-                            "action_id": "ai_enhance_button"
-                        }
+                            "action_id": "ai_enhance_button",
+                        },
                     },
                     {
                         "type": "input",
@@ -360,22 +324,17 @@ class SlackService:
                         "element": {
                             "type": "rich_text_input",
                             "action_id": "description_input",
-                            "placeholder": {
-                                "type": "plain_text",
-                                "text": "タスクの詳細を入力（任意）",
-                            },
+                            "placeholder": {"type": "plain_text", "text": "タスクの詳細を入力（任意）"},
                         },
-                        "label": {
-                            "type": "plain_text",
-                            "text": "内容詳細",
-                        },
-                        "optional": True
+                        "label": {"type": "plain_text", "text": "内容詳細"},
+                        "optional": True,
                     },
                 ],
                 "private_metadata": json.dumps({"requester_id": user_id}),
             }
 
-            self.client.views_open(trigger_id=trigger_id, view=modal)
+            # ローディングビューから本ビューへ更新
+            self.client.views_update(view_id=view_id, view=full_modal)
 
         except SlackApiError as e:
             print(f"Error opening modal: {e}")
