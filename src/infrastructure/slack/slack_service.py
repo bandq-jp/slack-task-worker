@@ -337,6 +337,24 @@ class SlackService:
                         },
                     },
                     {
+                        "type": "section",
+                        "block_id": "ai_helper_section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "🤖 *AI補完機能*\nタスクの詳細内容をAIに生成・改良してもらえます"
+                        },
+                        "accessory": {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "AI補完",
+                                "emoji": True
+                            },
+                            "value": "ai_enhance",
+                            "action_id": "ai_enhance_button"
+                        }
+                    },
+                    {
                         "type": "input",
                         "block_id": "description_block",
                         "element": {
