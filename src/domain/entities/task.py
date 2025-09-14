@@ -18,8 +18,10 @@ class TaskRequest:
     requester_slack_id: str = ""
     assignee_slack_id: str = ""
     title: str = ""
-    description: Union[str, Dict[str, Any]] = ""
+    description: Optional[Union[str, Dict[str, Any]]] = None
     due_date: datetime = field(default_factory=datetime.now)
+    task_type: str = ""
+    urgency: str = ""
     status: TaskStatus = TaskStatus.PENDING
     rejection_reason: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)

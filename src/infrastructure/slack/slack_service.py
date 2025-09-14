@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from src.domain.entities.task import TaskRequest
+from src.utils.text_converter import convert_rich_text_to_plain_text
 
 
 class SlackService:
@@ -70,13 +71,21 @@ class SlackService:
                             "type": "mrkdwn",
                             "text": f"*納期:*\n{task.due_date.strftime('%Y-%m-%d %H:%M')}",
                         },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*タスク種類:*\n{task.task_type}",
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*緊急度:*\n{task.urgency}",
+                        },
                     ],
                 },
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*内容:*\n{task.description}",
+                        "text": f"*内容:*\n{convert_rich_text_to_plain_text(task.description)}",
                     },
                 },
                 {
@@ -191,19 +200,35 @@ class SlackService:
             users_response = self.client.users_list()
             users = users_response["members"]
 
-            # ユーザー選択オプションを作成
+            # ユーザー選択オプションを作成（社内メンバーのみ）
             user_options = []
-            for user in users:
-                if not user.get("is_bot") and not user.get("deleted"):
-                    user_options.append(
-                        {
-                            "text": {
-                                "type": "plain_text",
-                                "text": user.get("real_name", user.get("name", "Unknown")),
-                            },
-                            "value": user["id"],
-                        }
-                    )
+            # 社内メンバーの条件: ボットでない、削除されていない、ゲストでない
+            internal_users = [
+                user for user in users 
+                if not user.get("is_bot") 
+                and not user.get("deleted") 
+                and not user.get("is_restricted")  # ゲストユーザーを除外
+                and not user.get("is_ultra_restricted")  # シングルチャンネルゲストを除外
+            ]
+            
+            # 最大100ユーザーに制限（Slack API制限）
+            max_users = min(len(internal_users), 100)
+            for i, user in enumerate(internal_users):
+                if i >= max_users:
+                    break
+                user_options.append(
+                    {
+                        "text": {
+                            "type": "plain_text",
+                            "text": user.get("real_name", user.get("name", "Unknown")),
+                        },
+                        "value": user["id"],
+                    }
+                )
+            
+            print(f"📊 社内メンバー: {len(internal_users)}人（表示: {min(len(internal_users), 100)}人）")
+            if len(internal_users) > 100:
+                print(f"⚠️ ユーザー数制限により100人のみ表示")
 
             modal = {
                 "type": "modal",
@@ -268,19 +293,65 @@ class SlackService:
                     },
                     {
                         "type": "input",
+                        "block_id": "task_type_block",
+                        "element": {
+                            "type": "static_select",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "タスク種類を選択",
+                            },
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "フリーランス関係"}, "value": "フリーランス関係"},
+                                {"text": {"type": "plain_text", "text": "モノテック関連"}, "value": "モノテック関連"},
+                                {"text": {"type": "plain_text", "text": "社内タスク"}, "value": "社内タスク"},
+                                {"text": {"type": "plain_text", "text": "HH関連"}, "value": "HH関連"},
+                                {"text": {"type": "plain_text", "text": "Sales関連"}, "value": "Sales関連"},
+                                {"text": {"type": "plain_text", "text": "PL関連"}, "value": "PL関連"},
+                            ],
+                            "action_id": "task_type_select",
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "タスク種類",
+                        },
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "urgency_block",
+                        "element": {
+                            "type": "static_select",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "緊急度を選択",
+                            },
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "ノンコア社内タスク"}, "value": "ノンコア社内タスク"},
+                                {"text": {"type": "plain_text", "text": "1週間以内"}, "value": "1週間以内"},
+                                {"text": {"type": "plain_text", "text": "最重要"}, "value": "最重要"},
+                            ],
+                            "action_id": "urgency_select",
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "緊急度",
+                        },
+                    },
+                    {
+                        "type": "input",
                         "block_id": "description_block",
                         "element": {
                             "type": "rich_text_input",
                             "action_id": "description_input",
                             "placeholder": {
                                 "type": "plain_text",
-                                "text": "タスクの詳細を入力",
+                                "text": "タスクの詳細を入力（任意）",
                             },
                         },
                         "label": {
                             "type": "plain_text",
-                            "text": "内容",
+                            "text": "内容詳細",
                         },
+                        "optional": True
                     },
                 ],
                 "private_metadata": json.dumps({"requester_id": user_id}),

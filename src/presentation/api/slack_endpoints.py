@@ -135,11 +135,32 @@ async def handle_interactive(request: Request):
                 # タスク作成モーダルの処理
                 values = view["state"]["values"]
                 private_metadata = json.loads(view.get("private_metadata", "{}"))
+                
+                # デバッグ: 受信したデータ構造を確認
+                print(f"🔍 Modal values keys: {list(values.keys())}")
+                for key, value in values.items():
+                    print(f"  {key}: {list(value.keys())}")
 
-                # リッチテキストを取得（変換しない）
-                description_rich = values["description_block"]["description_input"]["rich_text_value"]
-                # リッチテキストオブジェクトをそのまま渡す
-                description_data = description_rich
+                # 新しいフィールドを取得（存在しない場合はデフォルト値）
+                task_type = "社内タスク"  # デフォルト値
+                if "task_type_block" in values and "task_type_select" in values["task_type_block"]:
+                    task_type_data = values["task_type_block"]["task_type_select"].get("selected_option")
+                    if task_type_data:
+                        task_type = task_type_data["value"]
+                
+                urgency = "1週間以内"  # デフォルト値
+                if "urgency_block" in values and "urgency_select" in values["urgency_block"]:
+                    urgency_data = values["urgency_block"]["urgency_select"].get("selected_option")
+                    if urgency_data:
+                        urgency = urgency_data["value"]
+                
+                print(f"🎯 取得したフィールド: task_type={task_type}, urgency={urgency}")
+                
+                # リッチテキストを取得（オプショナル）
+                description_data = None
+                if "description_block" in values and values["description_block"]["description_input"].get("rich_text_value"):
+                    description_rich = values["description_block"]["description_input"]["rich_text_value"]
+                    description_data = description_rich
 
                 # 納期をdatetimeに変換
                 due_date_unix = values["due_date_block"]["due_date_picker"]["selected_date_time"]
@@ -149,8 +170,10 @@ async def handle_interactive(request: Request):
                     requester_slack_id=private_metadata["requester_id"],
                     assignee_slack_id=values["assignee_block"]["assignee_select"]["selected_option"]["value"],
                     title=values["title_block"]["title_input"]["value"],
-                    description=description_data,  # リッチテキストデータを渡す
+                    description=description_data,  # リッチテキストデータを渡す（オプショナル）
                     due_date=due_date,
+                    task_type=task_type,
+                    urgency=urgency,
                 )
 
                 await task_service.create_task_request(dto)

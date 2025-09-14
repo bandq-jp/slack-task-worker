@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 from notion_client import Client
 from src.domain.entities.task import TaskRequest
+from src.utils.text_converter import convert_rich_text_to_plain_text
 
 
 class NotionService:
@@ -158,6 +159,13 @@ class NotionService:
             # メールアドレスからNotionユーザーを検索
             requester_user = await self._find_user_by_email(requester_email)
             assignee_user = await self._find_user_by_email(assignee_email)
+            
+            # デバッグ: タスク情報確認
+            print(f"🏗️ Creating Notion task:")
+            print(f"   title: {task.title}")
+            print(f"   task_type: '{task.task_type}'")
+            print(f"   urgency: '{task.urgency}'")
+            print(f"   description type: {type(task.description)}")
 
             # Notionページのプロパティを構築（詳細はページ本文に記載）
             properties = {
@@ -178,6 +186,16 @@ class NotionService:
                 "ステータス": {
                     "select": {
                         "name": self._get_status_name(task.status.value),
+                    },
+                },
+                "タスク種類": {
+                    "select": {
+                        "name": task.task_type,
+                    },
+                },
+                "緊急度": {
+                    "select": {
+                        "name": task.urgency,
                     },
                 },
             }
@@ -208,8 +226,10 @@ class NotionService:
             else:
                 print(f"⚠️ Assignee '{assignee_email}' not found in Notion users. Skipping people property.")
 
-            # リッチテキストをNotionブロックに変換
-            description_blocks = self._convert_slack_rich_text_to_notion(task.description)
+            # リッチテキストをNotionブロックに変換（descriptionがある場合のみ）
+            description_blocks = []
+            if task.description:
+                description_blocks = self._convert_slack_rich_text_to_notion(task.description)
 
             # ページを作成（詳細はページ本文に記載）
             page_children = [
@@ -237,7 +257,9 @@ class NotionService:
                                 "text": {
                                     "content": f"依頼者: {requester_email or 'Unknown'}\n"
                                               f"依頼先: {assignee_email or 'Unknown'}\n"
-                                              f"納期: {task.due_date.strftime('%Y年%m月%d日 %H:%M')}",
+                                              f"納期: {task.due_date.strftime('%Y年%m月%d日 %H:%M')}\n"
+                                              f"タスク種類: {task.task_type}\n"
+                                              f"緊急度: {task.urgency}",
                                 },
                             },
                         ],
@@ -252,24 +274,28 @@ class NotionService:
                     "type": "divider",
                     "divider": {},
                 },
-                {
-                    "object": "block",
-                    "type": "heading_2",
-                    "heading_2": {
-                        "rich_text": [
-                            {
-                                "type": "text",
-                                "text": {
-                                    "content": "📝 タスク内容",
-                                },
-                            },
-                        ],
-                    },
-                },
             ]
 
-            # リッチテキストブロックを追加
-            page_children.extend(description_blocks)
+            # descriptionがある場合のみタスク内容セクションを追加
+            if description_blocks:
+                page_children.extend([
+                    {
+                        "object": "block",
+                        "type": "heading_2",
+                        "heading_2": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {
+                                        "content": "📝 タスク内容",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                ])
+                # リッチテキストブロックを追加
+                page_children.extend(description_blocks)
 
             # 進捗メモセクションを追加
             page_children.extend([
@@ -320,7 +346,8 @@ class NotionService:
             error_msg = f"Error creating Notion task: {e}"
             print(error_msg)
             print(f"Database ID: {self.database_id}")
-            print(f"Task details: title='{task.title}', description='{task.description[:100]}...'")
+            description_preview = convert_rich_text_to_plain_text(task.description)
+            print(f"Task details: title='{task.title}', description='{description_preview[:100]}...'")
 
             # 権限エラーの場合の詳細メッセージ
             if "shared with your integration" in str(e):

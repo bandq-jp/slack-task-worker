@@ -37,13 +37,19 @@ class TaskApplicationService:
         print(f"📧 Assignee email: {assignee_email}")
 
         # タスクエンティティを作成
+        print(f"🔧 DTO values: task_type='{dto.task_type}', urgency='{dto.urgency}'")
+        
         task = TaskRequest(
             requester_slack_id=dto.requester_slack_id,
             assignee_slack_id=dto.assignee_slack_id,
             title=dto.title,
             description=dto.description,
             due_date=dto.due_date,
+            task_type=dto.task_type,
+            urgency=dto.urgency,
         )
+        
+        print(f"🚀 Created task: task_type='{task.task_type}', urgency='{task.urgency}'")
 
         # 即座にNotionにタスクを保存（承認待ち状態で）
         notion_page_id = await self.notion_service.create_task(
@@ -129,6 +135,8 @@ class TaskApplicationService:
             title=task.title,
             description=task.description,
             due_date=task.due_date,
+            task_type=task.task_type,
+            urgency=task.urgency,
             status=task.status.value,
             rejection_reason=task.rejection_reason,
             created_at=task.created_at,

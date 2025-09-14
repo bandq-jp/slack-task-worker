@@ -14,8 +14,10 @@ class CreateTaskRequestDto(BaseModel):
     requester_slack_id: str = Field(..., description="依頼者のSlackユーザーID")
     assignee_slack_id: str = Field(..., description="依頼先のSlackユーザーID")
     title: str = Field(..., description="タスクタイトル")
-    description: Union[str, Dict[str, Any]] = Field(..., description="タスク内容（プレーンテキストまたはリッチテキスト）")
+    description: Optional[Union[str, Dict[str, Any]]] = Field(None, description="タスク内容（プレーンテキストまたはリッチテキスト）")
     due_date: datetime = Field(..., description="納期")
+    task_type: str = Field(..., description="タスク種類")
+    urgency: str = Field(..., description="緊急度")
 
 
 class TaskApprovalDto(BaseModel):
@@ -31,8 +33,10 @@ class TaskResponseDto(BaseModel):
     requester_slack_id: str
     assignee_slack_id: str
     title: str
-    description: str
+    description: Optional[Union[str, Dict[str, Any]]] = None
     due_date: datetime
+    task_type: str
+    urgency: str
     status: TaskStatusDto
     rejection_reason: Optional[str] = None
     created_at: datetime
