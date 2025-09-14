@@ -10,3 +10,4 @@ wheels/
 .venv
 .env
 .user_mapping.json
+.ai_conversations.json

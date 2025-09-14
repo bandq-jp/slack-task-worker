@@ -1,5 +1,9 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 import json
+import time
+import random
+import threading
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 import asyncio
@@ -38,40 +42,83 @@ class AIAnalysisResult:
 class ConversationHistory:
     """会話履歴管理"""
     
-    def __init__(self):
+    def __init__(self, storage_path: Optional[Union[str, Path]] = None):
+        self.lock = threading.Lock()
+        self.storage_path = Path(storage_path) if storage_path else Path(".ai_conversations.json")
         self.conversations: Dict[str, List[ConversationMessage]] = {}
+        self._load_from_disk()
+
+    def _load_from_disk(self):
+        try:
+            if self.storage_path.exists():
+                data = json.loads(self.storage_path.read_text(encoding="utf-8"))
+                for sid, msgs in data.items():
+                    self.conversations[sid] = [
+                        ConversationMessage(
+                            role=m.get("role", "user"),
+                            content=m.get("content", ""),
+                            timestamp=datetime.fromisoformat(m.get("timestamp"))
+                            if m.get("timestamp")
+                            else datetime.now(),
+                        )
+                        for m in msgs
+                    ]
+        except Exception:
+            # 読み込み失敗時は空として扱う（壊れたファイルでも稼働を止めない）
+            self.conversations = {}
+
+    def _flush_to_disk(self):
+        try:
+            payload = {
+                sid: [
+                    {
+                        "role": m.role,
+                        "content": m.content,
+                        "timestamp": m.timestamp.isoformat(),
+                    }
+                    for m in msgs
+                ]
+                for sid, msgs in self.conversations.items()
+            }
+            tmp_path = self.storage_path.with_suffix(self.storage_path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(self.storage_path)
+        except Exception:
+            # 書き込み失敗は致命的ではないため握りつぶす（ログは標準出力側に任せる）
+            pass
     
     def add_message(self, session_id: str, role: str, content: str):
         """メッセージを追加"""
-        if session_id not in self.conversations:
-            self.conversations[session_id] = []
-        
-        message = ConversationMessage(
-            role=role,
-            content=content,
-            timestamp=datetime.now()
-        )
-        self.conversations[session_id].append(message)
+        with self.lock:
+            if session_id not in self.conversations:
+                self.conversations[session_id] = []
+            message = ConversationMessage(role=role, content=content, timestamp=datetime.now())
+            self.conversations[session_id].append(message)
+            self._flush_to_disk()
     
     def get_conversation(self, session_id: str) -> List[ConversationMessage]:
         """会話履歴を取得"""
-        return self.conversations.get(session_id, [])
+        with self.lock:
+            return list(self.conversations.get(session_id, []))
     
     def clear_conversation(self, session_id: str):
         """会話履歴をクリア"""
-        if session_id in self.conversations:
-            del self.conversations[session_id]
+        with self.lock:
+            if session_id in self.conversations:
+                del self.conversations[session_id]
+            self._flush_to_disk()
     
 
 
 class TaskAIService:
     """タスクコンテンツAI拡張サービス"""
     
-    def __init__(self, api_key: str, timeout_seconds: float = 30.0, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: str, timeout_seconds: float = 30.0, model_name: str = "gemini-2.5-flash", history_storage_path: Optional[str] = None):
         self.client = genai.Client(api_key=api_key)
-        self.history = ConversationHistory()
+        self.history = ConversationHistory(storage_path=history_storage_path)
         self.timeout_seconds = timeout_seconds
         self.model_name = model_name
+        self.max_retries = 3
         
         # システム指示（簡潔かつ構造化応答を強制）
         self.system_instruction = """あなたはタスク管理の補助AIです。提供された情報をもとに、実行可能なタスク提案を行います。
@@ -117,25 +164,52 @@ class TaskAIService:
             },
         )
 
-    def _call_ai_with_timeout(self, prompt: str, timeout: Optional[float] = None) -> str:
-        """タイムアウト付きでAIを呼び出す"""
+    def _build_contents(self, session_id: str, user_text: Optional[str] = None) -> List[types.Content]:
+        """履歴 + 直近ユーザー指示からContentsを作る"""
+        contents: List[types.Content] = []
+        for msg in self.history.get_conversation(session_id):
+            role = "user" if msg.role == "user" else "model"
+            contents.append(
+                types.Content(role=role, parts=[types.Part.from_text(text=msg.content)])
+            )
+        if user_text:
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+        return contents
+
+    def _call_ai_with_timeout(self, contents: Union[str, List[types.Content]], timeout: Optional[float] = None) -> str:
+        """タイムアウト + リトライ付きでAIを呼び出す"""
         effective_timeout = timeout or self.timeout_seconds
         def call_ai():
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    max_output_tokens=800,
-                    temperature=0.2,
-                    # 構造化出力を要求
-                    response_mime_type="application/json",
-                    response_schema=self._response_schema(),
-                ),
-            )
-            # google.genaiは構造化設定時も.textにJSONが入る
-            return response.text
-        
+            attempts = self.max_retries
+            last_err: Optional[Exception] = None
+            for i in range(attempts):
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(thinking_budget=0),
+                            max_output_tokens=800,
+                            temperature=0.2,
+                            system_instruction=self.system_instruction,
+                            response_mime_type="application/json",
+                            response_schema=self._response_schema(),
+                        ),
+                    )
+                    return response.text
+                except Exception as e:
+                    msg = str(e).lower()
+                    retryable = any(k in msg for k in [
+                        "unavailable", "overloaded", "please try again", "deadline", "temporarily", "resource exhausted", "rate"
+                    ])
+                    last_err = e
+                    if retryable and i < attempts - 1:
+                        # 指数バックオフ + ジッタ
+                        sleep_s = (0.6 * (2 ** i)) + random.uniform(0, 0.3)
+                        time.sleep(sleep_s)
+                        continue
+                    raise
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(call_ai)
             try:
@@ -148,15 +222,11 @@ class TaskAIService:
         try:
             # 現在のタスク情報をプロンプトに整理
             prompt = self._build_analysis_prompt(task_info)
-            
-            # 会話履歴に追加
+            # 履歴にユーザー発話を追加し、履歴込みのcontentsを構築
             self.history.add_message(session_id, "user", prompt)
-            
-            # システム指示とユーザープロンプトを組み合わせ
-            full_prompt = f"{self.system_instruction}\n\n{prompt}"
-            
+            contents = self._build_contents(session_id)
             # タイムアウト（設定値）付きでGemini APIに送信（構造化JSONを期待）
-            response_text = self._call_ai_with_timeout(full_prompt)
+            response_text = self._call_ai_with_timeout(contents)
             
             # レスポンスを会話履歴に追加
             self.history.add_message(session_id, "model", response_text)
@@ -174,22 +244,12 @@ class TaskAIService:
     def refine_content(self, session_id: str, feedback: str) -> AIAnalysisResult:
         """ユーザーフィードバックを基にコンテンツを改良"""
         try:
-            prompt = f"前回の提案について以下のフィードバックがありました。改良してください：\n{feedback}"
-            
-            # 会話履歴に追加
-            self.history.add_message(session_id, "user", prompt)
-            
-            # 会話履歴を構築
-            conversation_history = self.history.get_conversation(session_id)
-            
-            # システム指示と会話履歴を組み合わせ
-            full_context = f"{self.system_instruction}\n\n"
-            for msg in conversation_history:
-                role_label = "ユーザー" if msg.role == "user" else "アシスタント"
-                full_context += f"{role_label}: {msg.content}\n"
-            
+            user_turn = f"以下のフィードバックを反映して改善してください。必要なら不足点も質問してください。\n{feedback}"
+            # 履歴にユーザー発話を追加し、履歴込みのcontentsを構築
+            self.history.add_message(session_id, "user", user_turn)
+            contents = self._build_contents(session_id)
             # タイムアウト（設定値）付きでGemini APIに送信（構造化JSONを期待）
-            response_text = self._call_ai_with_timeout(full_context)
+            response_text = self._call_ai_with_timeout(contents)
             
             # レスポンスを会話履歴に追加
             self.history.add_message(session_id, "model", response_text)

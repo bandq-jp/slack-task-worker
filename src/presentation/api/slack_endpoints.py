@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_timeout_seconds: float = 30.0
     gemini_model: str = "gemini-2.5-flash"
+    gemini_history_path: str = ".ai_conversations.json"
 
     class Config:
         env_file = ".env"
@@ -47,6 +48,7 @@ ai_service = (
         settings.gemini_api_key,
         timeout_seconds=settings.gemini_timeout_seconds,
         model_name=settings.gemini_model,
+        history_storage_path=settings.gemini_history_path,
     )
     if settings.gemini_api_key
     else None
@@ -342,16 +344,29 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
             if current_desc:
                 task_info.current_description = convert_rich_text_to_plain_text(current_desc)
         
-        # セッションID（ユーザーID + trigger_id の一部を使用）
-        session_id = f"{user_id}_{trigger_id[-8:]}"
+        # セッションIDの安定化:
+        # 1) 既存private_metadataのsession_id
+        # 2) Slackのroot_view_id（views.updateでも安定）
+        # 3) 現在のview.id
+        # 4) 最後の手段として user_id + trigger サフィックス
+        pm_raw = view.get("private_metadata")
+        pm = {}
+        try:
+            pm = json.loads(pm_raw) if pm_raw else {}
+        except Exception:
+            pm = {}
+        root_view_id = view.get("root_view_id")
+        session_id = pm.get("session_id") or root_view_id or view_id or f"{user_id}_{trigger_id[-8:]}"
         
         # セッション情報を保存（private_metadataサイズ制限対策）
+        requester_id = pm.get("requester_id")
         modal_sessions[session_id] = {
             "original_view": view,
             "user_id": user_id,
             "trigger_id": trigger_id,
             "task_info": task_info,
             "view_id": view_id,
+            "requester_id": requester_id,
         }
 
         # 1) まず即時ACK（処理中ビューに置換）
@@ -373,8 +388,14 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
                 else:
                     new_view = create_error_view(session_id, f"AI処理でエラーが発生しました: {result.message}")
 
-                # private_metadata に session_id を付与
-                new_view["private_metadata"] = json.dumps({"session_id": session_id})
+                # private_metadata をマージして付与（requester_id維持 + session_id追加）
+                base_pm = {}
+                try:
+                    base_pm = json.loads(view.get("private_metadata", "{}"))
+                except Exception:
+                    base_pm = {}
+                base_pm["session_id"] = session_id
+                new_view["private_metadata"] = json.dumps(base_pm)
                 slack_service.client.views_update(view_id=view_id, view=new_view)
             except Exception as e:
                 err_view = create_error_view(session_id, f"AI処理エラー: {str(e)}")
@@ -444,6 +465,9 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
         view_id = view.get("id")
         private_metadata = json.loads(view.get("private_metadata", "{}"))
         session_id = private_metadata.get("session_id")
+        session_data = modal_sessions.get(session_id, {})
+        requester_id = session_data.get("requester_id")
+        requester_id = session_data.get("requester_id")
         additional_info = values["additional_info_block"]["additional_info_input"].get("value", "")
 
         if not additional_info.strip():
@@ -473,7 +497,11 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
                     new_view = create_content_confirmation_modal_view(session_id, result)
                 else:
                     new_view = create_error_view(session_id, f"AI処理エラー: {result.message}")
-                new_view["private_metadata"] = json.dumps({"session_id": session_id})
+                # private_metadata をマージ（requester_id維持）
+                pm = {"session_id": session_id}
+                if requester_id:
+                    pm["requester_id"] = requester_id
+                new_view["private_metadata"] = json.dumps(pm)
                 if view_id:
                     slack_service.client.views_update(view_id=view_id, view=new_view)
             except Exception as e:
@@ -514,7 +542,7 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
     try:
         view = payload.get("view", {})
         view_id = view.get("id")
-        values = view["state"]["values"]
+        values = view.get("state", {}).get("values", {})
         private_metadata = json.loads(view.get("private_metadata", "{}"))
         
         session_id = private_metadata.get("session_id")
@@ -523,8 +551,10 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
         
         # フィードバックがあるかチェック
         feedback = ""
-        if "feedback_block" in values:
-            feedback = values["feedback_block"]["feedback_input"].get("value", "").strip()
+        fb_block = values.get("feedback_block")
+        if fb_block and "feedback_input" in fb_block:
+            raw = fb_block["feedback_input"].get("value")
+            feedback = (raw or "").strip()
         
         # 即時ACK: 処理中ビュー
         processing_view = create_processing_view(session_id, title="AI補完 - 反映中", description="内容を反映しています…")
@@ -538,8 +568,15 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                         new_view = create_error_view(session_id, "AI機能が利用できません。")
                     else:
                         result = ai_service.refine_content(session_id, feedback)
-                        modal_sessions[session_id]["generated_content"] = result.formatted_content
-                        new_view = create_content_confirmation_modal_view(session_id, result)
+                        if result.status == "insufficient_info":
+                            # 追加質問に戻す
+                            new_view = create_additional_info_modal_view(session_id, result)
+                        elif result.status == "ready_to_format":
+                            modal_sessions.setdefault(session_id, {})
+                            modal_sessions[session_id]["generated_content"] = result.formatted_content
+                            new_view = create_content_confirmation_modal_view(session_id, result)
+                        else:
+                            new_view = create_error_view(session_id, f"AI処理エラー: {result.message}")
                 else:
                     # フィードバックなし - 元のモーダルに戻って内容を反映
                     original_view = session_data.get("original_view")
@@ -562,11 +599,15 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                                         ]
                                     }
                                     break
-                        new_view = original_view
+                        new_view = original_view if original_view else create_error_view(session_id, "元のモーダル情報が見つかりませんでした。もう一度お試しください。")
                     else:
-                        new_view = {"type": "modal", "title": {"type": "plain_text", "text": "AI補完"}, "close": {"type": "plain_text", "text": "閉じる"}, "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "処理が完了しました。"}}]}
+                        new_view = create_error_view(session_id, "AI生成内容が見つかりませんでした。最初からやり直してください。")
 
-                new_view["private_metadata"] = json.dumps({"session_id": session_id})
+                # private_metadata をマージ（requester_id維持）
+                pm = {"session_id": session_id}
+                if requester_id:
+                    pm["requester_id"] = requester_id
+                new_view["private_metadata"] = json.dumps(pm)
                 if view_id:
                     slack_service.client.views_update(view_id=view_id, view=new_view)
             except Exception as e:
@@ -653,6 +694,7 @@ def create_additional_info_modal_view(session_id: str, result: AIAnalysisResult)
 
 def create_content_confirmation_modal_view(session_id: str, result: AIAnalysisResult) -> dict:
     """内容確認モーダルビューを作成"""
+    content_text = (result.formatted_content or result.message or "").strip()
     return {
         "type": "modal",
         "callback_id": "ai_content_confirmation_modal",
@@ -680,7 +722,7 @@ def create_content_confirmation_modal_view(session_id: str, result: AIAnalysisRe
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"```{result.formatted_content}```"
+                    "text": f"```{content_text}```"
                 }
             },
             {
