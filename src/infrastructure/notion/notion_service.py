@@ -176,7 +176,7 @@ class NotionService:
                     },
                 },
                 "ステータス": {
-                    "status": {
+                    "select": {
                         "name": self._get_status_name(task.status.value),
                     },
                 },
@@ -476,6 +476,8 @@ class NotionService:
             "pending": "承認待ち",
             "approved": "承認済み",
             "rejected": "差し戻し",
+            "completed": "完了",
+            "disabled": "無効",
         }
         return status_map.get(status, "承認待ち")
 
@@ -489,7 +491,7 @@ class NotionService:
         try:
             properties = {
                 "ステータス": {
-                    "status": {
+                    "select": {
                         "name": self._get_status_name(status),
                     },
                 },

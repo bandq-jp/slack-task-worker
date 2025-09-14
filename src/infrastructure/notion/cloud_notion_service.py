@@ -159,6 +159,8 @@ class CloudNotionService:
             "pending": "承認待ち",
             "approved": "承認済み",
             "rejected": "差し戻し",
+            "completed": "完了",
+            "disabled": "無効",
         }
         return status_map.get(status, "承認待ち")
 
@@ -183,7 +185,7 @@ class CloudNotionService:
                     "date": {"start": task.due_date.isoformat()}
                 },
                 "ステータス": {
-                    "status": {"name": self._get_status_name(task.status.value)}
+                    "select": {"name": self._get_status_name(task.status.value)}
                 },
             }
 
@@ -241,7 +243,7 @@ class CloudNotionService:
         try:
             properties = {
                 "ステータス": {
-                    "status": {"name": self._get_status_name(status)}
+                    "select": {"name": self._get_status_name(status)}
                 }
             }
 
