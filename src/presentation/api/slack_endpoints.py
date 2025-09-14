@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     slack_signing_secret: str = ""
     notion_token: str = ""
     notion_database_id: str = ""
+    mapping_database_id: str = ""
+    gcs_bucket_name: str = ""
+    google_application_credentials: str = ""
 
     class Config:
         env_file = ".env"
