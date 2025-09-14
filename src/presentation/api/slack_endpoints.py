@@ -74,30 +74,48 @@ async def handle_interactive(request: Request):
         trigger_id = payload["trigger_id"]
 
         if action_id == "approve_task":
-            # タスクを承認
-            dto = TaskApprovalDto(
-                task_id=task_id,
-                action="approve",
-                rejection_reason=None,
-            )
-            await task_service.handle_task_approval(dto)
+            try:
+                # タスクを承認
+                dto = TaskApprovalDto(
+                    task_id=task_id,
+                    action="approve",
+                    rejection_reason=None,
+                )
+                await task_service.handle_task_approval(dto)
 
-            # メッセージを更新
-            return JSONResponse(
-                content={
-                    "response_action": "update",
-                    "text": "✅ タスクを承認しました",
-                    "blocks": [
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": "✅ このタスクは承認されました",
-                            },
-                        }
-                    ],
-                }
-            )
+                # メッセージを更新
+                return JSONResponse(
+                    content={
+                        "response_action": "update",
+                        "text": "✅ タスクを承認しました",
+                        "blocks": [
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": "✅ このタスクは承認され、Notionに登録されました",
+                                },
+                            }
+                        ],
+                    }
+                )
+            except ValueError as e:
+                # エラーメッセージを表示
+                return JSONResponse(
+                    content={
+                        "response_action": "update",
+                        "text": "❌ 承認処理でエラーが発生しました",
+                        "blocks": [
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"❌ エラー: {str(e)}",
+                                },
+                            }
+                        ],
+                    }
+                )
 
         elif action_id == "reject_task":
             # 差し戻しモーダルを開く
@@ -110,53 +128,75 @@ async def handle_interactive(request: Request):
         callback_id = view["callback_id"]
 
         if callback_id == "create_task_modal":
-            # タスク作成モーダルの処理
-            values = view["state"]["values"]
-            private_metadata = json.loads(view.get("private_metadata", "{}"))
+            try:
+                # タスク作成モーダルの処理
+                values = view["state"]["values"]
+                private_metadata = json.loads(view.get("private_metadata", "{}"))
 
-            # リッチテキストからプレーンテキストを抽出
-            description_rich = values["description_block"]["description_input"]["rich_text_value"]
-            description_text = _extract_plain_text_from_rich_text(description_rich)
+                # リッチテキストからプレーンテキストを抽出
+                description_rich = values["description_block"]["description_input"]["rich_text_value"]
+                description_text = _extract_plain_text_from_rich_text(description_rich)
 
-            # 納期をdatetimeに変換
-            due_date_unix = values["due_date_block"]["due_date_picker"]["selected_date_time"]
-            due_date = datetime.fromtimestamp(due_date_unix)
+                # 納期をdatetimeに変換
+                due_date_unix = values["due_date_block"]["due_date_picker"]["selected_date_time"]
+                due_date = datetime.fromtimestamp(due_date_unix)
 
-            dto = CreateTaskRequestDto(
-                requester_slack_id=private_metadata["requester_id"],
-                assignee_slack_id=values["assignee_block"]["assignee_select"]["selected_option"]["value"],
-                title=values["title_block"]["title_input"]["value"],
-                description=description_text,
-                due_date=due_date,
-            )
+                dto = CreateTaskRequestDto(
+                    requester_slack_id=private_metadata["requester_id"],
+                    assignee_slack_id=values["assignee_block"]["assignee_select"]["selected_option"]["value"],
+                    title=values["title_block"]["title_input"]["value"],
+                    description=description_text,
+                    due_date=due_date,
+                )
 
-            await task_service.create_task_request(dto)
+                await task_service.create_task_request(dto)
 
-            return JSONResponse(
-                content={
-                    "response_action": "clear",
-                }
-            )
+                return JSONResponse(
+                    content={
+                        "response_action": "clear",
+                    }
+                )
+            except ValueError as e:
+                # タスク作成エラーの場合
+                return JSONResponse(
+                    content={
+                        "response_action": "errors",
+                        "errors": {
+                            "title_block": f"エラー: {str(e)}"
+                        }
+                    }
+                )
 
         elif callback_id == "reject_task_modal":
-            # 差し戻しモーダルの処理
-            values = view["state"]["values"]
-            private_metadata = json.loads(view.get("private_metadata", "{}"))
-            task_id = private_metadata["task_id"]
-            reason = values["reason_block"]["reason_input"]["value"]
+            try:
+                # 差し戻しモーダルの処理
+                values = view["state"]["values"]
+                private_metadata = json.loads(view.get("private_metadata", "{}"))
+                task_id = private_metadata["task_id"]
+                reason = values["reason_block"]["reason_input"]["value"]
 
-            dto = TaskApprovalDto(
-                task_id=task_id,
-                action="reject",
-                rejection_reason=reason,
-            )
-            await task_service.handle_task_approval(dto)
+                dto = TaskApprovalDto(
+                    task_id=task_id,
+                    action="reject",
+                    rejection_reason=reason,
+                )
+                await task_service.handle_task_approval(dto)
 
-            return JSONResponse(
-                content={
-                    "response_action": "clear",
-                }
-            )
+                return JSONResponse(
+                    content={
+                        "response_action": "clear",
+                    }
+                )
+            except ValueError as e:
+                # エラーレスポンスを返す
+                return JSONResponse(
+                    content={
+                        "response_action": "errors",
+                        "errors": {
+                            "reason_block": f"エラー: {str(e)}"
+                        }
+                    }
+                )
 
     return JSONResponse(content={})
 

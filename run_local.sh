@@ -3,7 +3,7 @@
 # ローカル開発用起動スクリプト
 
 echo "Starting FastAPI server..."
-PYTHONPATH=$(pwd) uv run python src/main.py &
+uv run python main.py &
 SERVER_PID=$!
 
 echo "Server started with PID: $SERVER_PID"

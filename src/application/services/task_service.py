@@ -36,7 +36,19 @@ class TaskApplicationService:
             due_date=dto.due_date,
         )
 
-        # タスクを保存
+        # 即座にNotionにタスクを保存（承認待ち状態で）
+        notion_page_id = await self.notion_service.create_task(
+            task=task,
+            requester_email=requester.get("profile", {}).get("email"),
+            assignee_email=assignee.get("profile", {}).get("email"),
+        )
+
+        if not notion_page_id:
+            raise ValueError("Notionへのタスク保存に失敗しました。サーバーログを確認してください。")
+
+        task.notion_page_id = notion_page_id
+
+        # インメモリリポジトリにも保存（承認処理で必要）
         saved_task = await self.task_repository.save(task)
 
         # 依頼先にDMで通知
@@ -59,17 +71,12 @@ class TaskApplicationService:
         if dto.action == "approve":
             task.approve()
 
-            # Notionにタスクを保存
-            requester_info = await self.slack_service.get_user_info(task.requester_slack_id)
-            assignee_info = await self.slack_service.get_user_info(task.assignee_slack_id)
-
-            notion_page_id = await self.notion_service.create_task(
-                task=task,
-                requester_email=requester_info.get("profile", {}).get("email"),
-                assignee_email=assignee_info.get("profile", {}).get("email"),
-            )
-
-            task.notion_page_id = notion_page_id
+            # Notionのステータスを更新
+            if task.notion_page_id:
+                await self.notion_service.update_task_status(
+                    page_id=task.notion_page_id,
+                    status=task.status.value,
+                )
 
             # 依頼者に承認通知
             await self.slack_service.notify_approval(
@@ -82,6 +89,14 @@ class TaskApplicationService:
                 raise ValueError("Rejection reason is required")
 
             task.reject(dto.rejection_reason)
+
+            # Notionのステータスを更新
+            if task.notion_page_id:
+                await self.notion_service.update_task_status(
+                    page_id=task.notion_page_id,
+                    status=task.status.value,
+                    rejection_reason=dto.rejection_reason,
+                )
 
             # 依頼者に差し戻し通知
             await self.slack_service.notify_rejection(

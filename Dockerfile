@@ -7,6 +7,7 @@ RUN pip install uv
 
 # Copy project files
 COPY pyproject.toml uv.lock ./
+COPY main.py ./
 COPY src ./src
 
 # Install dependencies
@@ -16,4 +17,4 @@ RUN uv sync --frozen
 EXPOSE 8000
 
 # Run the application
-CMD ["uv", "run", "python", "src/main.py"]
+CMD ["uv", "run", "python", "main.py"]

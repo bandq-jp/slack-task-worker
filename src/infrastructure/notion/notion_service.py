@@ -8,7 +8,11 @@ class NotionService:
 
     def __init__(self, notion_token: str, database_id: str):
         self.client = Client(auth=notion_token)
-        self.database_id = database_id
+        self.database_id = self._normalize_database_id(database_id)
+
+    def _normalize_database_id(self, database_id: str) -> str:
+        """データベースIDを正規化（ハイフンを削除）"""
+        return database_id.replace("-", "")
 
     async def create_task(
         self,
@@ -39,7 +43,7 @@ class NotionService:
                     },
                 },
                 "ステータス": {
-                    "select": {
+                    "status": {
                         "name": self._get_status_name(task.status.value),
                     },
                 },
@@ -178,8 +182,38 @@ class NotionService:
             return response["id"]
 
         except Exception as e:
-            print(f"Error creating Notion task: {e}")
-            raise
+            error_msg = f"Error creating Notion task: {e}"
+            print(error_msg)
+            print(f"Database ID: {self.database_id}")
+            print(f"Task details: title='{task.title}', description='{task.description[:100]}...'")
+
+            # 権限エラーの場合の詳細メッセージ
+            if "shared with your integration" in str(e):
+                print("\n🔧 解決方法:")
+                print("1. Notionでデータベースページを開く")
+                print("2. 右上の「共有」ボタンをクリック")
+                print("3. 「Task Request Bot」Integrationを招待")
+                print("4. 「招待」をクリック")
+
+            # データベースが見つからない場合
+            elif "Could not find database" in str(e):
+                print("\n🔧 データベースIDエラー:")
+                print(f"指定されたID '{self.database_id}' のデータベースが見つかりません")
+                print("1. NotionデータベースのURLを確認")
+                print("2. 環境変数 NOTION_DATABASE_ID を正しく設定")
+
+            # プロパティエラーの場合
+            elif "property" in str(e).lower():
+                print("\n🔧 プロパティエラー:")
+                print("以下のプロパティが正しく設定されているか確認:")
+                print("- タイトル (Title)")
+                print("- 納期 (Date)")
+                print("- ステータス (Select: 承認待ち, 承認済み, 差し戻し)")
+                print("- 依頼者 (Person)")
+                print("- 依頼先 (Person)")
+
+            # エラーを再発生させず、None を返す
+            return None
 
     async def _find_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
         """メールアドレスからNotionユーザーを検索"""
@@ -222,7 +256,7 @@ class NotionService:
         try:
             properties = {
                 "ステータス": {
-                    "select": {
+                    "status": {
                         "name": self._get_status_name(status),
                     },
                 },
