@@ -16,6 +16,7 @@
                 "chat:write",
                 "im:write",
                 "users:read",
+                "users:read.email",
                 "commands"
             ]
         }
