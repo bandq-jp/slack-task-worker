@@ -1,4 +1,5 @@
 from typing import List, Dict, Optional
+import json
 from dataclasses import dataclass
 from datetime import datetime
 import asyncio
@@ -66,42 +67,73 @@ class ConversationHistory:
 class TaskAIService:
     """タスクコンテンツAI拡張サービス"""
     
-    def __init__(self, api_key: str, timeout_seconds: float = 30.0):
+    def __init__(self, api_key: str, timeout_seconds: float = 30.0, model_name: str = "gemini-2.5-flash"):
         self.client = genai.Client(api_key=api_key)
         self.history = ConversationHistory()
         self.timeout_seconds = timeout_seconds
+        self.model_name = model_name
         
-        # システム指示（高速化のため簡潔に）
-        self.system_instruction = """タスク管理AI：提供情報から実行可能なタスクを作成
+        # システム指示（簡潔かつ構造化応答を強制）
+        self.system_instruction = """あなたはタスク管理の補助AIです。提供された情報をもとに、実行可能なタスク提案を行います。
 
-**判定基準:**
-- 十分な情報があれば → "ready_to_format" で詳細タスクを作成
-- 情報不足なら → "insufficient_info" で必要な質問を提示
+必ず次のルールに従ってください：
+- 返答はJSONのみ。前後に説明やコードブロック、コメントは付与しない。
+- スキーマに準拠：statusは"insufficient_info"または"ready_to_format"。
+- insufficientの場合、reasonと具体的なquestions配列（簡潔な日本語の質問文）を返す。
+- readyの場合、suggestion.descriptionに日本語で以下の順序で記述する：
+  1) 目的・背景\n 2) 作業内容（番号付き手順）\n 3) 完了条件\n 4) 注意点
+  可能ならtitle, category, urgency, due_date_isoも補完する（不明なら省略可）。
 
-**出力形式（充足時）:**
-目的・背景 → 作業内容（ステップ別） → 完了条件 → 注意点
+分類の指針（参考）：
+- 社内タスク / 技術調査 / 顧客対応 / 営業連絡 / 要件定義 / 資料作成 / その他
 
-**考慮事項（タスク種類別）:**
-フリーランス：契約・納期・仕様 / 技術：要件・テスト / 社内：関係者・プロセス / 営業：ターゲット・提案
+簡潔で、すぐ実行可能な形に整えてください。"""
 
-簡潔で実行可能なタスクを作成してください。"""
+        # デフォルトのモデル名（上位から注入される想定）
+        if not hasattr(self, "model_name"):
+            self.model_name = "gemini-2.5-flash"
     
+    def _response_schema(self) -> types.Schema:
+        """Geminiの構造化出力スキーマを定義"""
+        return types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "status": types.Schema(type=types.Type.STRING, enum=["insufficient_info", "ready_to_format"]),
+                "reason": types.Schema(type=types.Type.STRING),
+                "questions": types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.STRING),
+                ),
+                "suggestion": types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "title": types.Schema(type=types.Type.STRING),
+                        "category": types.Schema(type=types.Type.STRING),
+                        "urgency": types.Schema(type=types.Type.STRING),
+                        "due_date_iso": types.Schema(type=types.Type.STRING),
+                        "description": types.Schema(type=types.Type.STRING),
+                    },
+                ),
+            },
+        )
+
     def _call_ai_with_timeout(self, prompt: str, timeout: Optional[float] = None) -> str:
         """タイムアウト付きでAIを呼び出す"""
         effective_timeout = timeout or self.timeout_seconds
         def call_ai():
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    # thinking機能を無効にして高速化
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    # 出力トークン数制限
                     max_output_tokens=800,
-                    # 温度設定（一貫性を重視）
-                    temperature=0.2
-                )
+                    temperature=0.2,
+                    # 構造化出力を要求
+                    response_mime_type="application/json",
+                    response_schema=self._response_schema(),
+                ),
             )
+            # google.genaiは構造化設定時も.textにJSONが入る
             return response.text
         
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -123,7 +155,7 @@ class TaskAIService:
             # システム指示とユーザープロンプトを組み合わせ
             full_prompt = f"{self.system_instruction}\n\n{prompt}"
             
-            # タイムアウト（設定値）付きでGemini APIに送信
+            # タイムアウト（設定値）付きでGemini APIに送信（構造化JSONを期待）
             response_text = self._call_ai_with_timeout(full_prompt)
             
             # レスポンスを会話履歴に追加
@@ -156,7 +188,7 @@ class TaskAIService:
                 role_label = "ユーザー" if msg.role == "user" else "アシスタント"
                 full_context += f"{role_label}: {msg.content}\n"
             
-            # タイムアウト（設定値）付きでGemini APIに送信
+            # タイムアウト（設定値）付きでGemini APIに送信（構造化JSONを期待）
             response_text = self._call_ai_with_timeout(full_context)
             
             # レスポンスを会話履歴に追加
@@ -195,41 +227,72 @@ class TaskAIService:
         return "\n".join(prompt_parts)
     
     def _parse_ai_response(self, response_text: str) -> AIAnalysisResult:
-        """AIレスポンスを解析"""
+        """AIレスポンスを解析（JSON優先、失敗時はフォールバック）"""
+        # 1) まずJSONとして解釈
         try:
-            # 簡単なパターンマッチングでレスポンスを解析
-            lines = response_text.split('\n')
-            
-            # デフォルト値
-            status = "ready_to_format"
-            message = response_text
-            suggestions = None
-            formatted_content = None
-            
-            # キーワードベースの判定
+            data = json.loads(response_text)
+            status = data.get("status")
+
+            if status == "insufficient_info":
+                reason = data.get("reason") or "追加情報が必要です。"
+                questions = data.get("questions") or []
+                # 文字列で来ることも考慮
+                if isinstance(questions, str):
+                    questions = [questions]
+                return AIAnalysisResult(
+                    status="insufficient_info",
+                    message=reason,
+                    suggestions=questions,
+                )
+
+            if status in ("ready_to_format", "ready"):
+                suggestion = data.get("suggestion") or {}
+                desc = suggestion.get("description")
+                if not desc:
+                    # 最低限の整形を行う
+                    title = suggestion.get("title") or "タスク"
+                    category = suggestion.get("category")
+                    urgency = suggestion.get("urgency")
+                    due = suggestion.get("due_date_iso")
+                    meta = []
+                    if category:
+                        meta.append(f"カテゴリ: {category}")
+                    if urgency:
+                        meta.append(f"緊急度: {urgency}")
+                    if due:
+                        meta.append(f"納期: {due}")
+                    meta_text = ("\n" + " / ".join(meta)) if meta else ""
+                    desc = f"【{title}】{meta_text}\n\n1) 目的・背景\n- 不明確な点はありません。\n\n2) 作業内容\n- 必要な手順を実施してください。\n\n3) 完了条件\n- 合意済みの受け入れ基準を満たすこと。\n\n4) 注意点\n- 関係者との認識合わせを行ってください。"
+
+                return AIAnalysisResult(
+                    status="ready_to_format",
+                    message="生成に成功しました",
+                    formatted_content=desc.strip(),
+                )
+        except Exception:
+            pass
+
+        # 2) フォールバック：キーワードベース
+        try:
+            lines = response_text.split("\n")
             if any(keyword in response_text.lower() for keyword in ["不足", "足りない", "必要です", "教えて", "どの"]):
-                status = "insufficient_info"
-                # 質問部分を抽出（簡易版）
                 suggestions = []
                 for line in lines:
                     if "?" in line or "？" in line or line.strip().startswith("-"):
                         suggestions.append(line.strip())
                 if not suggestions:
                     suggestions = ["追加の情報を教えてください。"]
-            else:
-                # 整形されたコンテンツとして扱う
-                formatted_content = response_text.strip()
-            
+                return AIAnalysisResult(
+                    status="insufficient_info",
+                    message=response_text,
+                    suggestions=suggestions,
+                )
+            # それ以外は完成コンテンツとして扱う
             return AIAnalysisResult(
-                status=status,
-                message=message,
-                suggestions=suggestions,
-                formatted_content=formatted_content
+                status="ready_to_format",
+                message="生成に成功しました",
+                formatted_content=response_text.strip(),
             )
-            
         except Exception as e:
             print(f"❌ Response parsing error: {e}")
-            return AIAnalysisResult(
-                status="error",
-                message=f"レスポンス解析エラー: {str(e)}"
-            )
+            return AIAnalysisResult(status="error", message=f"レスポンス解析エラー: {str(e)}")

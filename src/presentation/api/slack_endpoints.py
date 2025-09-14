@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     google_application_credentials: str = ""
     gemini_api_key: str = ""
     gemini_timeout_seconds: float = 30.0
+    gemini_model: str = "gemini-2.5-flash"
 
     class Config:
         env_file = ".env"
@@ -42,7 +43,11 @@ user_repository = InMemoryUserRepository()
 slack_service = SlackService(settings.slack_token, settings.slack_bot_token)
 notion_service = NotionService(settings.notion_token, settings.notion_database_id)
 ai_service = (
-    TaskAIService(settings.gemini_api_key, timeout_seconds=settings.gemini_timeout_seconds)
+    TaskAIService(
+        settings.gemini_api_key,
+        timeout_seconds=settings.gemini_timeout_seconds,
+        model_name=settings.gemini_model,
+    )
     if settings.gemini_api_key
     else None
 )
