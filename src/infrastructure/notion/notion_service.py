@@ -22,22 +22,13 @@ class NotionService:
             requester_user = await self._find_user_by_email(requester_email)
             assignee_user = await self._find_user_by_email(assignee_email)
 
-            # Notionページのプロパティを構築
+            # Notionページのプロパティを構築（詳細はページ本文に記載）
             properties = {
                 "タイトル": {
                     "title": [
                         {
                             "text": {
                                 "content": task.title,
-                            },
-                        },
-                    ],
-                },
-                "詳細": {
-                    "rich_text": [
-                        {
-                            "text": {
-                                "content": task.description,
                             },
                         },
                     ],
@@ -76,11 +67,50 @@ class NotionService:
                     ],
                 }
 
-            # ページを作成
+            # ページを作成（詳細はページ本文に記載）
             response = self.client.pages.create(
                 parent={"database_id": self.database_id},
                 properties=properties,
                 children=[
+                    {
+                        "object": "block",
+                        "type": "heading_1",
+                        "heading_1": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {
+                                        "content": "📋 タスク概要",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "object": "block",
+                        "type": "callout",
+                        "callout": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {
+                                        "content": f"依頼者: {requester_email or 'Unknown'}\n"
+                                                  f"依頼先: {assignee_email or 'Unknown'}\n"
+                                                  f"納期: {task.due_date.strftime('%Y年%m月%d日 %H:%M')}",
+                                    },
+                                },
+                            ],
+                            "icon": {
+                                "emoji": "ℹ️",
+                            },
+                            "color": "blue_background",
+                        },
+                    },
+                    {
+                        "object": "block",
+                        "type": "divider",
+                        "divider": {},
+                    },
                     {
                         "object": "block",
                         "type": "heading_2",
@@ -89,7 +119,7 @@ class NotionService:
                                 {
                                     "type": "text",
                                     "text": {
-                                        "content": "タスク詳細",
+                                        "content": "📝 タスク内容",
                                     },
                                 },
                             ],
@@ -103,7 +133,40 @@ class NotionService:
                                 {
                                     "type": "text",
                                     "text": {
-                                        "content": task.description,
+                                        "content": task.description or "詳細な説明はありません。",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "object": "block",
+                        "type": "divider",
+                        "divider": {},
+                    },
+                    {
+                        "object": "block",
+                        "type": "heading_2",
+                        "heading_2": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {
+                                        "content": "✅ 進捗メモ",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {
+                                        "content": "（ここに進捗や作業メモを記入してください）",
                                     },
                                 },
                             ],
