@@ -15,7 +15,7 @@ load_dotenv()
 NOTION_TOKEN = os.getenv('NOTION_TOKEN')
 # マッピング用データベースID（環境変数から取得、なければメインのタスクDBを使用）
 MAPPING_DATABASE_ID = os.getenv('MAPPING_DATABASE_ID', os.getenv('NOTION_DATABASE_ID'))
-MAPPING_FILE = '/home/als0028/work/bandq/slack-test/.user_mapping.json'
+MAPPING_FILE = os.path.join(os.path.dirname(__file__), '..', '.user_mapping.json')
 
 class DatabaseMappingGenerator:
     """データベースからユーザーマッピングを自動生成"""

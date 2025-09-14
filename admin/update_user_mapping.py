@@ -15,7 +15,7 @@ from notion_client import Client
 load_dotenv()
 
 NOTION_TOKEN = os.getenv('NOTION_TOKEN')
-MAPPING_FILE = '/home/als0028/work/bandq/slack-test/.user_mapping.json'
+MAPPING_FILE = os.path.join(os.path.dirname(__file__), '..', '.user_mapping.json')
 
 class UserMappingUpdater:
     """ユーザーマッピングの更新とメンテナンス"""

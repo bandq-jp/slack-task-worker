@@ -13,7 +13,7 @@ class NotionService:
         self.client = Client(auth=notion_token)
         self.database_id = self._normalize_database_id(database_id)
         self.user_mapping = self._load_user_mapping()
-        self.mapping_file = '/home/als0028/work/bandq/slack-test/.user_mapping.json'
+        self.mapping_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.user_mapping.json')
 
     def _normalize_database_id(self, database_id: str) -> str:
         """データベースIDを正規化（ハイフンを削除）"""
@@ -21,7 +21,7 @@ class NotionService:
 
     def _load_user_mapping(self) -> Dict[str, Dict[str, Any]]:
         """ユーザーマッピングファイルを読み込み"""
-        mapping_file = '/home/als0028/work/bandq/slack-test/.user_mapping.json'
+        mapping_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.user_mapping.json')
         try:
             if os.path.exists(mapping_file):
                 with open(mapping_file, 'r', encoding='utf-8') as f:
