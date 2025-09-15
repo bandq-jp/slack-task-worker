@@ -467,7 +467,6 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
         session_id = private_metadata.get("session_id")
         session_data = modal_sessions.get(session_id, {})
         requester_id = session_data.get("requester_id")
-        requester_id = session_data.get("requester_id")
         additional_info = values["additional_info_block"]["additional_info_input"].get("value", "")
 
         if not additional_info.strip():
@@ -548,6 +547,7 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
         session_id = private_metadata.get("session_id")
         session_data = modal_sessions.get(session_id, {})
         generated_content = session_data.get("generated_content")
+        requester_id = session_data.get("requester_id")
         
         # フィードバックがあるかチェック
         feedback = ""
@@ -581,8 +581,19 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                     # フィードバックなし - 元のモーダルに戻って内容を反映
                     original_view = session_data.get("original_view")
                     if original_view and generated_content:
-                        if "blocks" in original_view:
-                            for block in original_view["blocks"]:
+                        # views.updateに必要なプロパティのみを抽出
+                        clean_view = {
+                            "type": original_view.get("type", "modal"),
+                            "callback_id": original_view.get("callback_id", "create_task_modal"),
+                            "title": original_view.get("title"),
+                            "submit": original_view.get("submit"),
+                            "close": original_view.get("close"),
+                            "blocks": original_view.get("blocks", [])
+                        }
+
+                        # 内容を反映
+                        if "blocks" in clean_view:
+                            for block in clean_view["blocks"]:
                                 if block.get("block_id") == "description_block":
                                     block["element"]["initial_value"] = {
                                         "type": "rich_text",
@@ -599,7 +610,7 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                                         ]
                                     }
                                     break
-                        new_view = original_view if original_view else create_error_view(session_id, "元のモーダル情報が見つかりませんでした。もう一度お試しください。")
+                        new_view = clean_view
                     else:
                         new_view = create_error_view(session_id, "AI生成内容が見つかりませんでした。最初からやり直してください。")
 
