@@ -304,18 +304,22 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
         title = ""
         if "title_block" in values:
             title = values["title_block"].get("title_input", {}).get("value", "")
-        
+
+        # titleがNoneの場合の処理
+        if title is None:
+            title = ""
+
         if not title.strip():
             return JSONResponse(
                 content={
-                    "response_action": "errors", 
+                    "response_action": "errors",
                     "errors": {
                         "title_block": "AI補完を使用するには、まずタイトルを入力してください。"
                     }
                 },
                 status_code=200
             )
-        
+
         # 現在のタスク情報を収集
         task_info = TaskInfo(title=title.strip())
         
@@ -344,19 +348,19 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
             if current_desc:
                 task_info.current_description = convert_rich_text_to_plain_text(current_desc)
         
-        # セッションIDの安定化:
-        # 1) 既存private_metadataのsession_id
-        # 2) Slackのroot_view_id（views.updateでも安定）
-        # 3) 現在のview.id
-        # 4) 最後の手段として user_id + trigger サフィックス
+        # セッションIDの生成と管理
         pm_raw = view.get("private_metadata")
         pm = {}
         try:
             pm = json.loads(pm_raw) if pm_raw else {}
         except Exception:
             pm = {}
-        root_view_id = view.get("root_view_id")
-        session_id = pm.get("session_id") or root_view_id or view_id or f"{user_id}_{trigger_id[-8:]}"
+
+        # AI補完用の一意なセッションIDを生成（フォーム入力中のみ有効）
+        # タイムスタンプを含めて一意性を確保
+        import time
+        session_id = f"ai_session_{user_id}_{int(time.time() * 1000)}"
+        print(f"🔍 AI補完セッション開始: {session_id}")
         
         # 現在のフォーム値を全て保存
         current_values = {
@@ -418,14 +422,16 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
 
         async def run_analysis_and_update():
             try:
+                # 新しいAI補完セッションを開始（古い会話履歴をクリア）
+                ai_service.history.start_new_session(session_id)
                 result = ai_service.analyze_task_info(session_id, task_info)
                 if not view_id:
                     return
                 if result.status == "insufficient_info":
-                    new_view = create_additional_info_modal_view(session_id, result)
+                    new_view = create_additional_info_modal_view(session_id, result, requester_id)
                 elif result.status == "ready_to_format":
                     modal_sessions[session_id]["generated_content"] = result.formatted_content
-                    new_view = create_content_confirmation_modal_view(session_id, result)
+                    new_view = create_content_confirmation_modal_view(session_id, result, requester_id)
                 else:
                     new_view = create_error_view(session_id, f"AI処理でエラーが発生しました: {result.message}")
 
@@ -510,6 +516,8 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
         requester_id = session_data.get("requester_id")
         additional_info = values["additional_info_block"]["additional_info_input"].get("value", "")
 
+        print(f"🔍 追加情報入力セッション: {session_id}, 履歴数: {len(ai_service.history.get_conversation(session_id))}")
+
         if not additional_info.strip():
             return JSONResponse(
                 content={
@@ -531,10 +539,10 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
             try:
                 result = ai_service.refine_content(session_id, additional_info)
                 if result.status == "insufficient_info":
-                    new_view = create_additional_info_modal_view(session_id, result)
+                    new_view = create_additional_info_modal_view(session_id, result, requester_id)
                 elif result.status == "ready_to_format":
                     modal_sessions[session_id]["generated_content"] = result.formatted_content
-                    new_view = create_content_confirmation_modal_view(session_id, result)
+                    new_view = create_content_confirmation_modal_view(session_id, result, requester_id)
                 else:
                     new_view = create_error_view(session_id, f"AI処理エラー: {result.message}")
                 # private_metadata をマージ（requester_id維持）
@@ -589,6 +597,8 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
         session_data = modal_sessions.get(session_id, {})
         generated_content = session_data.get("generated_content")
         requester_id = session_data.get("requester_id")
+
+        print(f"🔍 内容確認セッション: {session_id}, 履歴数: {len(ai_service.history.get_conversation(session_id)) if ai_service else 0}")
         
         # フィードバックがあるかチェック
         feedback = ""
@@ -611,11 +621,11 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                         result = ai_service.refine_content(session_id, feedback)
                         if result.status == "insufficient_info":
                             # 追加質問に戻す
-                            new_view = create_additional_info_modal_view(session_id, result)
+                            new_view = create_additional_info_modal_view(session_id, result, requester_id)
                         elif result.status == "ready_to_format":
                             modal_sessions.setdefault(session_id, {})
                             modal_sessions[session_id]["generated_content"] = result.formatted_content
-                            new_view = create_content_confirmation_modal_view(session_id, result)
+                            new_view = create_content_confirmation_modal_view(session_id, result, requester_id)
                         else:
                             new_view = create_error_view(session_id, f"AI処理エラー: {result.message}")
                 else:
@@ -716,10 +726,15 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
         )
 
 
-def create_additional_info_modal_view(session_id: str, result: AIAnalysisResult) -> dict:
+def create_additional_info_modal_view(session_id: str, result: AIAnalysisResult, requester_id: str = None) -> dict:
     """追加情報モーダルビューを作成"""
     suggestions_text = "\n".join(f"• {s}" for s in result.suggestions) if result.suggestions else ""
-    
+
+    # private_metadataを構築
+    pm = {"session_id": session_id}
+    if requester_id:
+        pm["requester_id"] = requester_id
+
     return {
         "type": "modal",
         "callback_id": "ai_additional_info_modal",
@@ -744,7 +759,7 @@ def create_additional_info_modal_view(session_id: str, result: AIAnalysisResult)
                 }
             },
             {
-                "type": "section", 
+                "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": f"*必要な追加情報:*\n{suggestions_text}"
@@ -768,20 +783,24 @@ def create_additional_info_modal_view(session_id: str, result: AIAnalysisResult)
                 }
             }
         ],
-        "private_metadata": json.dumps({
-            "session_id": session_id
-        })
+        "private_metadata": json.dumps(pm)
     }
 
 
-def create_content_confirmation_modal_view(session_id: str, result: AIAnalysisResult) -> dict:
+def create_content_confirmation_modal_view(session_id: str, result: AIAnalysisResult, requester_id: str = None) -> dict:
     """内容確認モーダルビューを作成"""
     content_text = (result.formatted_content or result.message or "").strip()
+
+    # private_metadataを構築
+    pm = {"session_id": session_id}
+    if requester_id:
+        pm["requester_id"] = requester_id
+
     return {
         "type": "modal",
         "callback_id": "ai_content_confirmation_modal",
         "title": {
-            "type": "plain_text", 
+            "type": "plain_text",
             "text": "AI補完 - 内容確認"
         },
         "submit": {
@@ -826,9 +845,7 @@ def create_content_confirmation_modal_view(session_id: str, result: AIAnalysisRe
                 "optional": True
             }
         ],
-        "private_metadata": json.dumps({
-            "session_id": session_id
-        })
+        "private_metadata": json.dumps(pm)
     }
 
 

@@ -41,7 +41,7 @@ class AIAnalysisResult:
 
 class ConversationHistory:
     """会話履歴管理"""
-    
+
     def __init__(self, storage_path: Optional[Union[str, Path]] = None):
         self.lock = threading.Lock()
         self.storage_path = Path(storage_path) if storage_path else Path(".ai_conversations.json")
@@ -86,7 +86,15 @@ class ConversationHistory:
         except Exception:
             # 書き込み失敗は致命的ではないため握りつぶす（ログは標準出力側に任せる）
             pass
-    
+
+
+class InMemoryConversationHistory:
+    """メモリ内のみで管理する会話履歴（一時的なセッション用）"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.conversations: Dict[str, List[ConversationMessage]] = {}
+
     def add_message(self, session_id: str, role: str, content: str):
         """メッセージを追加"""
         with self.lock:
@@ -94,28 +102,36 @@ class ConversationHistory:
                 self.conversations[session_id] = []
             message = ConversationMessage(role=role, content=content, timestamp=datetime.now())
             self.conversations[session_id].append(message)
-            self._flush_to_disk()
-    
+            # メモリ内なので、ディスクフラッシュは不要（空実装）
+
     def get_conversation(self, session_id: str) -> List[ConversationMessage]:
         """会話履歴を取得"""
         with self.lock:
             return list(self.conversations.get(session_id, []))
-    
+
     def clear_conversation(self, session_id: str):
         """会話履歴をクリア"""
         with self.lock:
             if session_id in self.conversations:
                 del self.conversations[session_id]
-            self._flush_to_disk()
-    
+
+    def start_new_session(self, session_id: str):
+        """新しいセッションを開始（既存の会話をクリア）"""
+        with self.lock:
+            self.conversations[session_id] = []
+
+    def _flush_to_disk(self):
+        """メモリ内クラスなので何もしない（互換性のため）"""
+        pass
 
 
 class TaskAIService:
     """タスクコンテンツAI拡張サービス"""
-    
+
     def __init__(self, api_key: str, timeout_seconds: float = 30.0, model_name: str = "gemini-2.5-flash", history_storage_path: Optional[str] = None):
         self.client = genai.Client(api_key=api_key)
-        self.history = ConversationHistory(storage_path=history_storage_path)
+        # メモリ内のみで会話履歴を管理（フォーム入力時のみの一時的な使用）
+        self.history = InMemoryConversationHistory()
         self.timeout_seconds = timeout_seconds
         self.model_name = model_name
         self.max_retries = 3
@@ -167,13 +183,22 @@ class TaskAIService:
     def _build_contents(self, session_id: str, user_text: Optional[str] = None) -> List[types.Content]:
         """履歴 + 直近ユーザー指示からContentsを作る"""
         contents: List[types.Content] = []
-        for msg in self.history.get_conversation(session_id):
+        conversation = self.history.get_conversation(session_id)
+
+        print(f"🔍 [_build_contents] セッション {session_id}: 履歴数={len(conversation)}")
+
+        for i, msg in enumerate(conversation):
             role = "user" if msg.role == "user" else "model"
+            print(f"  履歴[{i}] {role}: {msg.content[:100]}...")
             contents.append(
                 types.Content(role=role, parts=[types.Part.from_text(text=msg.content)])
             )
+
         if user_text:
+            print(f"  新規ユーザー入力: {user_text[:100]}...")
             contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+
+        print(f"🔍 [_build_contents] 最終的なcontents数: {len(contents)}")
         return contents
 
     def _call_ai_with_timeout(self, contents: Union[str, List[types.Content]], timeout: Optional[float] = None) -> str:
