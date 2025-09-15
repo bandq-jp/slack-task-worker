@@ -358,10 +358,51 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
         root_view_id = view.get("root_view_id")
         session_id = pm.get("session_id") or root_view_id or view_id or f"{user_id}_{trigger_id[-8:]}"
         
+        # 現在のフォーム値を全て保存
+        current_values = {
+            "assignee": None,
+            "title": title,
+            "due_date": None,
+            "task_type": None,
+            "urgency": None,
+            "description": None
+        }
+
+        # 依頼先
+        if "assignee_block" in values:
+            assignee_data = values["assignee_block"].get("assignee_select", {}).get("selected_option")
+            if assignee_data:
+                current_values["assignee"] = assignee_data
+
+        # 納期（Unix timestamp）
+        if "due_date_block" in values:
+            due_date_unix = values["due_date_block"].get("due_date_picker", {}).get("selected_date_time")
+            if due_date_unix:
+                current_values["due_date"] = due_date_unix
+
+        # タスク種類
+        if "task_type_block" in values:
+            task_type_data = values["task_type_block"].get("task_type_select", {}).get("selected_option")
+            if task_type_data:
+                current_values["task_type"] = task_type_data
+
+        # 緊急度
+        if "urgency_block" in values:
+            urgency_data = values["urgency_block"].get("urgency_select", {}).get("selected_option")
+            if urgency_data:
+                current_values["urgency"] = urgency_data
+
+        # 内容（リッチテキスト）
+        if "description_block" in values:
+            current_desc = values["description_block"].get("description_input", {}).get("rich_text_value")
+            if current_desc:
+                current_values["description"] = current_desc
+
         # セッション情報を保存（private_metadataサイズ制限対策）
         requester_id = pm.get("requester_id")
         modal_sessions[session_id] = {
             "original_view": view,
+            "current_values": current_values,
             "user_id": user_id,
             "trigger_id": trigger_id,
             "task_info": task_info,
@@ -580,6 +621,8 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                 else:
                     # フィードバックなし - 元のモーダルに戻って内容を反映
                     original_view = session_data.get("original_view")
+                    current_values = session_data.get("current_values", {})
+
                     if original_view and generated_content:
                         # views.updateに必要なプロパティのみを抽出
                         clean_view = {
@@ -591,25 +634,53 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                             "blocks": original_view.get("blocks", [])
                         }
 
-                        # 内容を反映
+                        # 保存した値を各ブロックに復元
                         if "blocks" in clean_view:
                             for block in clean_view["blocks"]:
-                                if block.get("block_id") == "description_block":
-                                    block["element"]["initial_value"] = {
-                                        "type": "rich_text",
-                                        "elements": [
-                                            {
-                                                "type": "rich_text_section",
-                                                "elements": [
-                                                    {
-                                                        "type": "text",
-                                                        "text": generated_content
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                    break
+                                block_id = block.get("block_id")
+
+                                # 依頼先
+                                if block_id == "assignee_block" and current_values.get("assignee"):
+                                    if "element" in block:
+                                        block["element"]["initial_option"] = current_values["assignee"]
+
+                                # タイトル
+                                elif block_id == "title_block" and current_values.get("title"):
+                                    if "element" in block:
+                                        block["element"]["initial_value"] = current_values["title"]
+
+                                # 納期
+                                elif block_id == "due_date_block" and current_values.get("due_date"):
+                                    if "element" in block:
+                                        block["element"]["initial_date_time"] = current_values["due_date"]
+
+                                # タスク種類
+                                elif block_id == "task_type_block" and current_values.get("task_type"):
+                                    if "element" in block:
+                                        block["element"]["initial_option"] = current_values["task_type"]
+
+                                # 緊急度
+                                elif block_id == "urgency_block" and current_values.get("urgency"):
+                                    if "element" in block:
+                                        block["element"]["initial_option"] = current_values["urgency"]
+
+                                # 内容詳細（AI生成内容を設定）
+                                elif block_id == "description_block":
+                                    if "element" in block:
+                                        block["element"]["initial_value"] = {
+                                            "type": "rich_text",
+                                            "elements": [
+                                                {
+                                                    "type": "rich_text_section",
+                                                    "elements": [
+                                                        {
+                                                            "type": "text",
+                                                            "text": generated_content
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
                         new_view = clean_view
                     else:
                         new_view = create_error_view(session_id, "AI生成内容が見つかりませんでした。最初からやり直してください。")
