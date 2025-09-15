@@ -40,16 +40,8 @@ class NotionService:
     def _convert_slack_rich_text_to_notion(self, description: Union[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """SlackリッチテキストをNotionブロック形式に変換"""
         if isinstance(description, str):
-            # プレーンテキストの場合
-            return [
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [{"type": "text", "text": {"content": description}}]
-                    }
-                }
-            ]
+            # プレーンテキストの場合、マークダウンパースを実行
+            return self._parse_markdown_to_notion_blocks(description)
 
         # Slackリッチテキスト形式の場合
         blocks = []
@@ -147,6 +139,112 @@ class NotionService:
             ]
 
         return blocks
+
+    def _parse_markdown_to_notion_blocks(self, markdown_text: str) -> List[Dict[str, Any]]:
+        """マークダウンテキストをNotionブロック形式に変換"""
+        blocks = []
+        lines = markdown_text.split('\n')
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # 空行をスキップ
+            if not line:
+                i += 1
+                continue
+
+            # 見出し2の処理 (## で始まる)
+            if line.startswith('## '):
+                heading_text = line[3:].strip()
+                blocks.append({
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {
+                        "rich_text": [{"type": "text", "text": {"content": heading_text}}]
+                    }
+                })
+                i += 1
+                continue
+
+            # 見出し1の処理 (# で始まる)
+            elif line.startswith('# '):
+                heading_text = line[2:].strip()
+                blocks.append({
+                    "object": "block",
+                    "type": "heading_1",
+                    "heading_1": {
+                        "rich_text": [{"type": "text", "text": {"content": heading_text}}]
+                    }
+                })
+                i += 1
+                continue
+
+            # 番号付きリストの処理 (数字. で始まる)
+            elif line and len(line) > 2 and line[0].isdigit() and line[1:3].startswith('. '):
+                list_text = line[line.find('. ') + 2:].strip()
+                blocks.append({
+                    "object": "block",
+                    "type": "numbered_list_item",
+                    "numbered_list_item": {
+                        "rich_text": [{"type": "text", "text": {"content": list_text}}]
+                    }
+                })
+                i += 1
+                continue
+
+            # 箇条書きリストの処理 (- で始まる)
+            elif line.startswith('- '):
+                list_text = line[2:].strip()
+                blocks.append({
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [{"type": "text", "text": {"content": list_text}}]
+                    }
+                })
+                i += 1
+                continue
+
+            # 通常の段落の処理
+            else:
+                # 連続する段落行を収集
+                paragraph_lines = [line]
+                i += 1
+                while i < len(lines) and lines[i].strip() and not self._is_markdown_special_line(lines[i].strip()):
+                    paragraph_lines.append(lines[i].strip())
+                    i += 1
+
+                paragraph_text = ' '.join(paragraph_lines)
+                if paragraph_text:
+                    blocks.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [{"type": "text", "text": {"content": paragraph_text}}]
+                        }
+                    })
+
+        return blocks
+
+    def _is_markdown_special_line(self, line: str) -> bool:
+        """マークダウンの特殊行（見出し、リストなど）かどうかを判定"""
+        if not line:
+            return False
+
+        # 見出し
+        if line.startswith('# ') or line.startswith('## '):
+            return True
+
+        # 番号付きリスト
+        if len(line) > 2 and line[0].isdigit() and line[1:3].startswith('. '):
+            return True
+
+        # 箇条書きリスト
+        if line.startswith('- '):
+            return True
+
+        return False
 
     async def create_task(
         self,

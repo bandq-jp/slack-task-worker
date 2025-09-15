@@ -143,8 +143,8 @@ class TaskAIService:
 - 返答はJSONのみ。前後に説明やコードブロック、コメントは付与しない。
 - スキーマに準拠：statusは"insufficient_info"または"ready_to_format"。
 - insufficientの場合、reasonと具体的なquestions配列（簡潔な日本語の質問文）を返す。
-- readyの場合、suggestion.descriptionに日本語で以下の順序で記述する：
-  1) 目的・背景\n 2) 作業内容（番号付き手順）\n 3) 完了条件\n 4) 注意点
+- readyの場合、suggestion.descriptionにマークダウン形式で以下の順序で記述する（必ず各セクション間に改行\\nを入れる）：
+  ## 目的・背景\\n（目的や背景を記述）\\n\\n## 作業内容\\n1. （具体的な手順1）\\n2. （具体的な手順2）\\n\\n## 完了条件\\n（完了の判断基準）\\n\\n## 注意点\\n（重要な注意事項）
   可能ならtitle, category, urgency, due_date_isoも補完する（不明なら省略可）。
 
 分類の指針（参考）：
@@ -214,7 +214,7 @@ class TaskAIService:
                         contents=contents,
                         config=types.GenerateContentConfig(
                             thinking_config=types.ThinkingConfig(thinking_budget=0),
-                            max_output_tokens=800,
+                            max_output_tokens=1000,
                             temperature=0.2,
                             system_instruction=self.system_instruction,
                             response_mime_type="application/json",
@@ -347,7 +347,7 @@ class TaskAIService:
                     if due:
                         meta.append(f"納期: {due}")
                     meta_text = ("\n" + " / ".join(meta)) if meta else ""
-                    desc = f"【{title}】{meta_text}\n\n1) 目的・背景\n- 不明確な点はありません。\n\n2) 作業内容\n- 必要な手順を実施してください。\n\n3) 完了条件\n- 合意済みの受け入れ基準を満たすこと。\n\n4) 注意点\n- 関係者との認識合わせを行ってください。"
+                    desc = f"【{title}】{meta_text}\n\n## 目的・背景\n不明確な点はありません。\n\n## 作業内容\n1. 必要な手順を実施してください。\n\n## 完了条件\n合意済みの受け入れ基準を満たすこと。\n\n## 注意点\n関係者との認識合わせを行ってください。"
 
                 return AIAnalysisResult(
                     status="ready_to_format",
