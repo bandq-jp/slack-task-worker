@@ -48,6 +48,13 @@ class NotionService:
 
         try:
             if isinstance(description, dict) and "elements" in description:
+                # まず全テキストを抽出してマークダウンかどうか判定
+                all_text = self._extract_text_from_slack_rich_text(description)
+
+                # マークダウン形式の場合はマークダウンパーサーを使用
+                if self._is_markdown_text(all_text):
+                    return self._parse_markdown_to_notion_blocks(all_text)
+
                 for element in description["elements"]:
                     if element.get("type") == "rich_text_section":
                         rich_text_items = []
@@ -245,6 +252,53 @@ class NotionService:
             return True
 
         return False
+
+    def _extract_text_from_slack_rich_text(self, slack_rich_text: Dict[str, Any]) -> str:
+        """Slackリッチテキストからプレーンテキストを抽出"""
+        text_parts = []
+
+        try:
+            if isinstance(slack_rich_text, dict) and "elements" in slack_rich_text:
+                for element in slack_rich_text["elements"]:
+                    if element.get("type") == "rich_text_section":
+                        for item in element.get("elements", []):
+                            if item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif item.get("type") == "link":
+                                text_parts.append(item.get("url", ""))
+        except Exception:
+            pass
+
+        return "".join(text_parts)
+
+    def _is_markdown_text(self, text: str) -> bool:
+        """テキストがマークダウン形式かどうかを判定"""
+        if not text:
+            return False
+
+        # マークダウンの特徴的なパターンをチェック
+        lines = text.split('\n')
+        markdown_patterns = 0
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 見出し
+            if line.startswith('## ') or line.startswith('# '):
+                markdown_patterns += 1
+
+            # 番号付きリスト
+            if len(line) > 2 and line[0].isdigit() and line[1:3].startswith('. '):
+                markdown_patterns += 1
+
+            # 箇条書きリスト
+            if line.startswith('- '):
+                markdown_patterns += 1
+
+        # マークダウンパターンが2つ以上あればマークダウンテキストと判定
+        return markdown_patterns >= 2
 
     async def create_task(
         self,
