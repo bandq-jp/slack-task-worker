@@ -115,16 +115,20 @@ async def handle_interactive(request: Request):
     payload = json.loads(form.get("payload", "{}"))
 
     interaction_type = payload.get("type")
+    print(f"🔍 Interactive payload received: type={interaction_type}")
 
     if interaction_type == "block_actions":
         # ボタンアクションの処理
         action = payload["actions"][0]
         action_id = action["action_id"]
-        task_id = action["value"]
+        task_id = action.get("value", "")
         trigger_id = payload["trigger_id"]
         view = payload.get("view", {})
         view_id = view.get("id")
         user_id = payload.get("user", {}).get("id", "unknown")
+        
+        print(f"🎯 Block action received: action_id={action_id}, user_id={user_id}")
+        print(f"🔍 Available actions: {[a.get('action_id') for a in payload.get('actions', [])]}")
 
         if action_id == "approve_task":
             try:
@@ -177,7 +181,12 @@ async def handle_interactive(request: Request):
         
         elif action_id == "ai_enhance_button":
             # AI補完ボタンの処理: まず即時ACKし、その後非同期で更新
+            print(f"🤖 AI補完ボタン押下: user_id={user_id}, action_id={action_id}")
             return await handle_ai_enhancement_async(payload, trigger_id, view_id, user_id)
+        
+        else:
+            print(f"⚠️ Unknown action_id: {action_id}")
+            return JSONResponse(content={"response_action": "errors", "errors": {"general": f"不明なアクション: {action_id}"}})
 
     elif interaction_type == "view_submission":
         # モーダル送信の処理
@@ -286,7 +295,11 @@ async def handle_interactive(request: Request):
         elif callback_id == "ai_content_confirmation_modal":
             # 内容確認モーダルの処理
             return await handle_content_confirmation(payload)
+        
+        else:
+            print(f"⚠️ Unknown callback_id: {callback_id}")
 
+    print(f"⚠️ Unhandled interaction_type: {interaction_type}")
     return JSONResponse(content={})
 
 
@@ -311,8 +324,11 @@ async def handle_ai_enhancement(payload: dict, trigger_id: str) -> JSONResponse:
 
 async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: Optional[str], user_id: str) -> JSONResponse:
     """AI補完処理（非同期化）: 3秒以内にACKして処理中表示 → 後でviews.update"""
+    print(f"🚀 handle_ai_enhancement_async 開始: user_id={user_id}, view_id={view_id}")
     try:
+        print(f"🔍 AI service check: ai_service={ai_service is not None}")
         if not ai_service:
+            print("❌ AI service is None - GEMINI_API_KEY not configured")
             return JSONResponse(
                 content={
                     "response_action": "errors",
@@ -324,19 +340,24 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
             )
         
         # 現在のモーダルの値を取得
+        print("🔍 モーダル値取得中...")
         view = payload.get("view", {})
         values = view.get("state", {}).get("values", {})
+        print(f"🔍 Values keys: {list(values.keys())}")
         
         # タイトルをチェック（必須条件）
         title = ""
+        print("🔍 タイトル取得中...")
         if "title_block" in values:
             title = values["title_block"].get("title_input", {}).get("value", "")
+        print(f"🔍 取得したタイトル: '{title}'")
 
         # titleがNoneの場合の処理
         if title is None:
             title = ""
 
         if not title.strip():
+            print("❌ タイトルが空のためエラーを返します")
             return JSONResponse(
                 content={
                     "response_action": "errors",
@@ -348,7 +369,9 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
             )
 
         # 現在のタスク情報を収集
+        print("🔍 TaskInfo作成中...")
         task_info = TaskInfo(title=title.strip())
+        print(f"🔍 TaskInfo作成完了: {task_info.title}")
         
         # タスク種類
         if "task_type_block" in values:
@@ -442,16 +465,23 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
         }
 
         # 1) まず即時ACK（処理中ビューに置換）
+        print("🔍 処理中ビュー作成中...")
         processing_view = create_processing_view(session_id, title="AI補完 - 実行中", description="AIが内容を整理中です… しばらくお待ちください。")
+        print("✅ 処理中ビュー作成完了")
 
         # 非同期でGemini処理 → 結果に応じてviews.update
         import asyncio
+        print("🔍 非同期AI処理開始準備中...")
 
         async def run_analysis_and_update():
             try:
+                print(f"🤖 AI分析処理開始: session_id={session_id}")
                 # 新しいAI補完セッションを開始（古い会話履歴をクリア）
+                print("🔍 AI履歴セッション開始中...")
                 ai_service.history.start_new_session(session_id)
+                print("🔍 AI分析実行中...")
                 result = ai_service.analyze_task_info(session_id, task_info)
+                print(f"✅ AI分析完了: status={result.status}")
                 if not view_id:
                     return
                 if result.status == "insufficient_info":
@@ -479,8 +509,11 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
                 except Exception:
                     pass
 
+        print("🔍 非同期タスク作成中...")
         asyncio.create_task(run_analysis_and_update())
+        print("✅ 非同期タスク作成完了")
 
+        print("🔍 処理中ビューを返却中...")
         return JSONResponse(content={"response_action": "update", "view": processing_view}, status_code=200)
             
     except Exception as e:

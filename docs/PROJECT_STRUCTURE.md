@@ -12,7 +12,7 @@ slack-test/
 ├── pyproject.toml          # Python依存関係
 ├── .env                    # 環境変数（秘匿）
 ├── .env.example            # 環境変数のテンプレート
-├── .user_mapping.json      # ユーザーマッピングファイル（秘匿）
+# ├── .user_mapping.json      # ユーザーマッピングファイル（廃止: 動的検索に移行）
 ├── .gitignore             # Git除外設定
 ├── uv.lock               # 依存関係ロックファイル
 │
@@ -30,9 +30,9 @@ slack-test/
 │   ├── SLACK_EMAIL_FIX.md       # Slack メール権限修正ガイド
 │   └── SLACK_TROUBLESHOOTING.md # Slack トラブルシューティング
 │
-├── admin/               # 管理ツール
-│   ├── setup_user_mapping.py   # ユーザーマッピング初期セットアップ
-│   └── update_user_mapping.py  # ユーザーマッピング更新・メンテナンス
+# ├── admin/               # 管理ツール（廃止: 動的検索により不要）
+#    ├── setup_user_mapping.py   # ユーザーマッピング初期セットアップ（廃止）
+#    └── update_user_mapping.py  # ユーザーマッピング更新・メンテナンス（廃止）
 │
 ├── tests/               # テスト・調査スクリプト
 │   ├── test_complete_workflow.py    # 完全ワークフローテスト
@@ -56,12 +56,12 @@ slack-test/
 ### 初回セットアップ
 1. **依存関係インストール**: `uv sync`
 2. **環境変数設定**: `.env.example` を参考に `.env` を作成
-3. **ユーザーマッピング**: `python admin/setup_user_mapping.py` を実行
+3. **ユーザーマッピング**: 動的検索により自動実行（セットアップ不要）
 4. **アプリケーション起動**: `uv run main.py`
 
 ### 開発・運用
 - **ローカル開発**: `scripts/run_local.sh`
-- **新しいユーザー追加**: `python admin/update_user_mapping.py`
+- **新しいユーザー追加**: 自動検索により対応（手動追加不要）
 - **テスト実行**: `python tests/test_complete_workflow.py`
 - **トラブルシューティング**: `docs/` 内の各種ガイドを参照
 
@@ -73,12 +73,13 @@ slack-test/
 ## 🔧 管理・メンテナンス
 
 ### ユーザー管理
-- **初回**: `admin/setup_user_mapping.py` で既存データベースからユーザー抽出
-- **追加**: `admin/update_user_mapping.py` で新規ユーザー追加・更新
+- **動的検索**: Notionデータベース・Peopleプロパティから自動検索
+- **ゲスト対応**: 正規メンバー以外のゲストユーザーも自動発見
 - **確認**: `tests/test_complete_workflow.py` で動作確認
 
 ### ファイル管理
-- **秘匿ファイル**: `.env`, `.user_mapping.json` は Git に含めない
+- **秘匿ファイル**: `.env` は Git に含めない
+- **廃止**: `.user_mapping.json` は動的ユーザー検索システムにより不要
 - **設定ファイル**: `setup/` 内のマニフェストファイルを使用
 - **ログ**: アプリケーション実行時のログで問題を特定
 

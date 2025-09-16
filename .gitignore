@@ -9,5 +9,5 @@ wheels/
 # Virtual environments
 .venv
 .env
-.user_mapping.json
+# .user_mapping.json (deprecated - now using dynamic user search)
 .ai_conversations.json

@@ -71,7 +71,7 @@ echo "GCS_BUCKET_NAME=$BUCKET_NAME" >> .env
 # ローカルマッピングファイルをGCSにデプロイ
 python admin/deploy_mapping_to_gcs.py \
   --bucket $BUCKET_NAME \
-  --local-file .user_mapping.json \
+  # --local-file .user_mapping.json \  # 廃止: 動的ユーザー検索を使用
   --service-account service-account-key.json
 
 # デプロイ確認
@@ -166,7 +166,7 @@ python admin/deploy_mapping_to_gcs.py \
 # ローカル更新後にGCS同期
 python admin/deploy_mapping_to_gcs.py \
   --bucket $BUCKET_NAME \
-  --local-file .user_mapping.json
+  # --local-file .user_mapping.json  # 廃止: 動的ユーザー検索を使用
 ```
 
 ### スケーリング調整
