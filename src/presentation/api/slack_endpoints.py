@@ -6,7 +6,11 @@ from typing import Dict, Any, Optional
 from src.application.services.task_service import TaskApplicationService
 from src.application.dto.task_dto import CreateTaskRequestDto, TaskApprovalDto
 from src.infrastructure.slack.slack_service import SlackService
-from src.infrastructure.notion.notion_service import NotionService
+from src.infrastructure.notion.dynamic_notion_service import DynamicNotionService
+from src.infrastructure.repositories.notion_user_repository_impl import NotionUserRepositoryImpl
+from src.infrastructure.repositories.slack_user_repository_impl import SlackUserRepositoryImpl
+from src.application.services.user_mapping_service import UserMappingApplicationService
+from src.domain.services.user_mapping_domain_service import UserMappingDomainService
 from src.infrastructure.repositories.task_repository_impl import InMemoryTaskRepository
 from src.infrastructure.repositories.user_repository_impl import InMemoryUserRepository
 from src.services.ai_service import TaskAIService, TaskInfo, AIAnalysisResult
@@ -38,11 +42,34 @@ settings = Settings()
 # セッション情報を一時的に保存する辞書
 modal_sessions = {}
 
-# リポジトリとサービスのインスタンス化（簡易的なDI）
+print("🚀 Dynamic User Mapping System initialized!")
+print(f"📊 Notion Database: {settings.notion_database_id}")
+print("🔄 Using dynamic user search (no mapping files)")
+
+# リポジトリとサービスのインスタンス化（DDD版DI）
 task_repository = InMemoryTaskRepository()
 user_repository = InMemoryUserRepository()
 slack_service = SlackService(settings.slack_token, settings.slack_bot_token)
-notion_service = NotionService(settings.notion_token, settings.notion_database_id)
+
+# 新しいDDD実装のサービス初期化
+notion_user_repository = NotionUserRepositoryImpl(
+    notion_token=settings.notion_token,
+    default_database_id=settings.notion_database_id
+)
+slack_user_repository = SlackUserRepositoryImpl(slack_token=settings.slack_bot_token)
+mapping_domain_service = UserMappingDomainService()
+user_mapping_service = UserMappingApplicationService(
+    notion_user_repository=notion_user_repository,
+    slack_user_repository=slack_user_repository,
+    mapping_domain_service=mapping_domain_service
+)
+
+# 動的Notionサービス（DDD ベース）
+notion_service = DynamicNotionService(
+    notion_token=settings.notion_token,
+    database_id=settings.notion_database_id,
+    user_mapping_service=user_mapping_service
+)
 ai_service = (
     TaskAIService(
         settings.gemini_api_key,
