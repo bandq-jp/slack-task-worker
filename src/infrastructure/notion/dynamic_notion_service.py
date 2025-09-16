@@ -4,38 +4,27 @@ from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 from notion_client import Client
 from src.domain.entities.task import TaskRequest
+from src.domain.entities.notion_user import NotionUser
+from src.application.services.user_mapping_service import UserMappingApplicationService
 from src.utils.text_converter import convert_rich_text_to_plain_text
 
 
-class NotionService:
-    """Notion APIサービス"""
+class DynamicNotionService:
+    """動的ユーザー検索対応のNotion APIサービス（DDD版）"""
 
-    def __init__(self, notion_token: str, database_id: str):
+    def __init__(
+        self, 
+        notion_token: str, 
+        database_id: str,
+        user_mapping_service: UserMappingApplicationService
+    ):
         self.client = Client(auth=notion_token)
         self.database_id = self._normalize_database_id(database_id)
-        self.user_mapping = self._load_user_mapping()
-        self.mapping_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), '.user_mapping.json')
+        self.user_mapping_service = user_mapping_service
 
     def _normalize_database_id(self, database_id: str) -> str:
         """データベースIDを正規化（ハイフンを削除）"""
         return database_id.replace("-", "")
-
-    def _load_user_mapping(self) -> Dict[str, Dict[str, Any]]:
-        """ユーザーマッピングファイルを読み込み"""
-        mapping_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), '.user_mapping.json')
-        try:
-            if os.path.exists(mapping_file):
-                with open(mapping_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    email_mapping = data.get('email_to_notion_id', {})
-                    print(f"✅ ユーザーマッピング読み込み: {len(email_mapping)}人")
-                    return email_mapping
-            else:
-                print("⚠️ ユーザーマッピングファイルが見つかりません")
-                return {}
-        except Exception as e:
-            print(f"❌ ユーザーマッピング読み込みエラー: {e}")
-            return {}
 
     def _convert_slack_rich_text_to_notion(self, description: Union[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """SlackリッチテキストをNotionブロック形式に変換"""
@@ -306,18 +295,18 @@ class NotionService:
         requester_email: str,
         assignee_email: str,
     ) -> str:
-        """Notionデータベースにタスクを作成"""
+        """Notionデータベースにタスクを作成（動的ユーザー検索版）"""
         try:
-            # メールアドレスからNotionユーザーを検索
-            requester_user = await self._find_user_by_email(requester_email)
-            assignee_user = await self._find_user_by_email(assignee_email)
-            
-            # デバッグ: タスク情報確認
-            print(f"🏗️ Creating Notion task:")
+            print(f"🏗️ Creating Notion task (Dynamic version):")
             print(f"   title: {task.title}")
             print(f"   task_type: '{task.task_type}'")
             print(f"   urgency: '{task.urgency}'")
-            print(f"   description type: {type(task.description)}")
+
+            # 新しいアプリケーションサービスでユーザー検索
+            requester_user, assignee_user = await self.user_mapping_service.get_notion_user_for_task_creation(
+                requester_email, 
+                assignee_email
+            )
 
             # Notionページのプロパティを構築（詳細はページ本文に記載）
             properties = {
@@ -358,10 +347,11 @@ class NotionService:
                     "people": [
                         {
                             "object": "user",
-                            "id": requester_user["id"],
+                            "id": str(requester_user.user_id),
                         },
                     ],
                 }
+                print(f"✅ 依頼者設定: {requester_user.display_name()} ({requester_email})")
             else:
                 print(f"⚠️ Requester '{requester_email}' not found in Notion users. Skipping people property.")
 
@@ -371,10 +361,11 @@ class NotionService:
                     "people": [
                         {
                             "object": "user",
-                            "id": assignee_user["id"],
+                            "id": str(assignee_user.user_id),
                         },
                     ],
                 }
+                print(f"✅ 依頼先設定: {assignee_user.display_name()} ({assignee_email})")
             else:
                 print(f"⚠️ Assignee '{assignee_email}' not found in Notion users. Skipping people property.")
 
@@ -492,10 +483,11 @@ class NotionService:
                 children=page_children,
             )
 
+            print("✅ Dynamic Notion task created successfully!")
             return response["id"]
 
         except Exception as e:
-            error_msg = f"Error creating Notion task: {e}"
+            error_msg = f"Error creating Notion task (dynamic): {e}"
             print(error_msg)
             print(f"Database ID: {self.database_id}")
             description_preview = convert_rich_text_to_plain_text(task.description)
@@ -528,126 +520,6 @@ class NotionService:
 
             # エラーを再発生させず、None を返す
             return None
-
-    async def _find_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
-        """メールアドレスからNotionユーザーを検索（マッピングファイル使用）"""
-        if not email:
-            print(f"⚠️ Email is empty for user lookup")
-            return None
-
-        email_lower = email.lower()
-        print(f"🔍 ユーザー検索: {email}")
-
-        # Method 1: マッピングファイルから検索（高速）
-        if email_lower in self.user_mapping:
-            user_data = self.user_mapping[email_lower]
-            print(f"✅ マッピングファイルで発見: {user_data['name']} ({email})")
-
-            # Notionユーザーオブジェクト形式で返す
-            return {
-                'id': user_data['id'],
-                'object': user_data.get('object', 'user'),
-                'type': user_data.get('type', 'person'),
-                'name': user_data['name'],
-                'avatar_url': user_data.get('avatar_url'),
-                'person': {'email': user_data['email']}
-            }
-
-        # Method 2: フォールバック - データベース検索
-        print(f"⚠️ マッピングにない - データベース検索実行: {email}")
-        fallback_user = await self._fallback_user_search(email)
-        if fallback_user:
-            # 見つかった場合はマッピングに追加
-            await self._add_user_to_mapping(email, fallback_user)
-            return fallback_user
-
-        # Method 3: 従来のusers.list()検索（正規メンバー用）
-        print(f"⚠️ DB検索でも見つからず - 正規メンバー検索: {email}")
-        try:
-            users = self.client.users.list()
-            print(f"📋 正規メンバー検索: {len(users.get('results', []))}人")
-
-            for user in users.get("results", []):
-                if user.get("type") == "person":
-                    user_email = user.get("person", {}).get("email")
-                    if user_email and user_email.lower() == email_lower:
-                        print(f"✅ 正規メンバーで発見: {user.get('name')} ({user_email})")
-                        # マッピングに追加
-                        await self._add_user_to_mapping(email, user)
-                        return user
-
-        except Exception as e:
-            print(f"❌ 正規メンバー検索エラー: {e}")
-
-        print(f"❌ ユーザーが見つかりません: {email}")
-        print("💡 解決方法:")
-        print(f"   1. update_user_mapping.py を使用してユーザーを追加")
-        print(f"   2. setup_user_mapping.py を再実行してマッピングを更新")
-        return None
-
-    async def _fallback_user_search(self, email: str) -> Optional[Dict[str, Any]]:
-        """フォールバック: データベース内のページからユーザーを検索"""
-        try:
-            pages = self.client.databases.query(database_id=self.database_id)
-
-            for page in pages.get('results', []):
-                properties = page.get('properties', {})
-
-                for prop_name, prop_data in properties.items():
-                    if prop_data.get('type') == 'people':
-                        people = prop_data.get('people', [])
-
-                        for person in people:
-                            person_email = person.get('person', {}).get('email')
-                            if person_email and person_email.lower() == email.lower():
-                                print(f"✅ DB検索で発見: {person.get('name')} ({person_email})")
-                                return {
-                                    'id': person.get('id'),
-                                    'object': person.get('object', 'user'),
-                                    'type': person.get('type', 'person'),
-                                    'name': person.get('name'),
-                                    'avatar_url': person.get('avatar_url'),
-                                    'person': {'email': person_email}
-                                }
-
-            return None
-
-        except Exception as e:
-            print(f"❌ フォールバック検索エラー: {e}")
-            return None
-
-    async def _add_user_to_mapping(self, email: str, user_data: Dict[str, Any]):
-        """新しく発見したユーザーをマッピングファイルに追加"""
-        try:
-            email_lower = email.lower()
-
-            # メモリ内マッピングを更新
-            self.user_mapping[email_lower] = {
-                'id': user_data['id'],
-                'name': user_data['name'],
-                'email': email,
-                'type': user_data.get('type', 'person'),
-                'object': user_data.get('object', 'user'),
-                'avatar_url': user_data.get('avatar_url'),
-                'last_updated': datetime.now().isoformat(),
-                'auto_discovered': True
-            }
-
-            # ファイルを更新
-            if os.path.exists(self.mapping_file):
-                with open(self.mapping_file, 'r', encoding='utf-8') as f:
-                    mapping_data = json.load(f)
-
-                mapping_data['email_to_notion_id'][email_lower] = self.user_mapping[email_lower]
-                mapping_data['last_updated'] = datetime.now().isoformat()
-
-                with open(self.mapping_file, 'w', encoding='utf-8') as f:
-                    json.dump(mapping_data, f, indent=2, ensure_ascii=False)
-
-                print(f"✅ ユーザーマッピング自動追加: {user_data['name']} ({email})")
-
-        except Exception as e:
-            print(f"❌ マッピング追加エラー: {e}")
 
     def _get_status_name(self, status: str) -> str:
         """ステータスの表示名を取得"""
