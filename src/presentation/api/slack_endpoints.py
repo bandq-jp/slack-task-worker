@@ -195,9 +195,10 @@ async def handle_interactive(request: Request):
 
         if callback_id == "create_task_modal":
             try:
-                # タスク作成モーダルの処理
+                # タスク作成モーダルの処理（非同期化）
                 values = view["state"]["values"]
                 private_metadata = json.loads(view.get("private_metadata", "{}"))
+                view_id = view.get("id")
                 
                 # デバッグ: 受信したデータ構造を確認
                 print(f"🔍 Modal values keys: {list(values.keys())}")
@@ -239,11 +240,92 @@ async def handle_interactive(request: Request):
                     urgency=urgency,
                 )
 
-                await task_service.create_task_request(dto)
+                # 1) 即座にローディング画面を返す（3秒制限回避）
+                loading_view = {
+                    "type": "modal",
+                    "callback_id": "task_creating_loading",
+                    "title": {"type": "plain_text", "text": "タスク依頼作成中"},
+                    "close": {"type": "plain_text", "text": "キャンセル"},
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "⏳ *タスク依頼を作成しています...*\n\nしばらくお待ちください。"
+                            }
+                        }
+                    ]
+                }
 
+                # 2) バックグラウンドでタスク作成処理を実行
+                import asyncio
+                
+                async def run_task_creation():
+                    try:
+                        print("🔄 バックグラウンドタスク作成開始...")
+                        await task_service.create_task_request(dto)
+                        print("✅ タスク作成成功")
+                        
+                        # 成功時: 成功メッセージを表示
+                        if view_id:
+                            try:
+                                success_view = {
+                                    "type": "modal",
+                                    "callback_id": "task_created_success",
+                                    "title": {"type": "plain_text", "text": "タスク依頼完了"},
+                                    "close": {"type": "plain_text", "text": "閉じる"},
+                                    "blocks": [
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": f"✅ *タスク依頼が正常に送信されました*\n\n*件名:* {dto.title}\n*依頼先:* <@{dto.assignee_slack_id}>\n\n承認待ちです。結果はDMでお知らせします。"
+                                            }
+                                        }
+                                    ]
+                                }
+                                slack_service.client.views_update(view_id=view_id, view=success_view)
+                            except Exception as e:
+                                print(f"⚠️ 成功メッセージ表示エラー: {e}")
+                                
+                    except Exception as e:
+                        print(f"❌ タスク作成エラー: {e}")
+                        
+                        # 失敗時: 元のフォームに戻る（値を保持）
+                        if view_id:
+                            try:
+                                # 元のフォーム構造を再構築
+                                error_view = {
+                                    "type": "modal",
+                                    "callback_id": "create_task_modal",
+                                    "title": {"type": "plain_text", "text": "タスク依頼作成"},
+                                    "submit": {"type": "plain_text", "text": "作成"},
+                                    "close": {"type": "plain_text", "text": "キャンセル"},
+                                    "blocks": [
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": f"❌ *エラーが発生しました*\n{str(e)}\n\n下記のフォームで再度お試しください："
+                                            }
+                                        },
+                                        # 元のフォームブロックを再構築（値を保持）
+                                        *_rebuild_task_form_blocks_with_values(values, task_type, urgency)
+                                    ],
+                                    "private_metadata": json.dumps(private_metadata)
+                                }
+                                slack_service.client.views_update(view_id=view_id, view=error_view)
+                            except Exception as update_error:
+                                print(f"⚠️ エラーメッセージ表示失敗: {update_error}")
+
+                # 非同期タスクを開始
+                asyncio.create_task(run_task_creation())
+
+                # 即座にローディング画面を返す
                 return JSONResponse(
                     content={
-                        "response_action": "clear",
+                        "response_action": "update",
+                        "view": loading_view
                     }
                 )
             except ValueError as e:
@@ -480,7 +562,7 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
                 print("🔍 AI履歴セッション開始中...")
                 ai_service.history.start_new_session(session_id)
                 print("🔍 AI分析実行中...")
-                result = ai_service.analyze_task_info(session_id, task_info)
+                result = await ai_service.analyze_task_info(session_id, task_info)
                 print(f"✅ AI分析完了: status={result.status}")
                 if not view_id:
                     return
@@ -597,7 +679,7 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
 
         async def run_refine_and_update():
             try:
-                result = ai_service.refine_content(session_id, additional_info)
+                result = await ai_service.refine_content(session_id, additional_info)
                 if result.status == "insufficient_info":
                     new_view = create_additional_info_modal_view(session_id, result, requester_id)
                 elif result.status == "ready_to_format":
@@ -678,7 +760,7 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
                     if not ai_service:
                         new_view = create_error_view(session_id, "AI機能が利用できません。")
                     else:
-                        result = ai_service.refine_content(session_id, feedback)
+                        result = await ai_service.refine_content(session_id, feedback)
                         if result.status == "insufficient_info":
                             # 追加質問に戻す
                             new_view = create_additional_info_modal_view(session_id, result, requester_id)
@@ -935,3 +1017,131 @@ def create_error_view(session_id: str, message: str) -> dict:
         ],
         "private_metadata": json.dumps({"session_id": session_id})
     }
+
+
+def _rebuild_task_form_blocks_with_values(values: dict, task_type: str, urgency: str) -> list:
+    """エラー時に値を保持したタスクフォームブロックを再構築"""
+    
+    # 依頼先は再選択が必要（ユーザーリスト再取得が複雑なため）
+    assignee_initial_option = None
+    
+    # タイトルの初期値
+    title_initial_value = ""
+    if "title_block" in values and "title_input" in values["title_block"]:
+        title_initial_value = values["title_block"]["title_input"].get("value", "")
+    
+    # 納期の初期値
+    due_date_initial = None
+    if "due_date_block" in values and "due_date_picker" in values["due_date_block"]:
+        due_date_initial = values["due_date_block"]["due_date_picker"].get("selected_date_time")
+    
+    # 内容詳細の初期値
+    description_initial = None
+    if "description_block" in values and "description_input" in values["description_block"]:
+        description_rich = values["description_block"]["description_input"].get("rich_text_value")
+        if description_rich:
+            description_initial = description_rich
+
+    blocks = [
+        {
+            "type": "input",
+            "block_id": "assignee_block",
+            "element": {
+                "type": "static_select",
+                "placeholder": {"type": "plain_text", "text": "依頼先を再選択してください"},
+                "options": [{"text": {"type": "plain_text", "text": "ユーザーリストを読み込み中..."}, "value": "loading"}],
+                "action_id": "assignee_select",
+            },
+            "label": {"type": "plain_text", "text": "依頼先"},
+        },
+        {
+            "type": "input",
+            "block_id": "title_block",
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "title_input",
+                "placeholder": {"type": "plain_text", "text": "タスクの件名を入力"},
+            },
+            "label": {"type": "plain_text", "text": "件名"},
+        },
+        {
+            "type": "input",
+            "block_id": "due_date_block",
+            "element": {
+                "type": "datetimepicker",
+                "action_id": "due_date_picker"
+            },
+            "label": {"type": "plain_text", "text": "納期"},
+        },
+        {
+            "type": "input",
+            "block_id": "task_type_block",
+            "element": {
+                "type": "static_select",
+                "placeholder": {"type": "plain_text", "text": "タスク種類を選択"},
+                "options": [
+                    {"text": {"type": "plain_text", "text": "フリーランス関係"}, "value": "フリーランス関係"},
+                    {"text": {"type": "plain_text", "text": "モノテック関連"}, "value": "モノテック関連"},
+                    {"text": {"type": "plain_text", "text": "社内タスク"}, "value": "社内タスク"},
+                    {"text": {"type": "plain_text", "text": "HH関連"}, "value": "HH関連"},
+                    {"text": {"type": "plain_text", "text": "Sales関連"}, "value": "Sales関連"},
+                    {"text": {"type": "plain_text", "text": "PL関連"}, "value": "PL関連"},
+                ],
+                "action_id": "task_type_select",
+            },
+            "label": {"type": "plain_text", "text": "タスク種類"},
+        },
+        {
+            "type": "input",
+            "block_id": "urgency_block",
+            "element": {
+                "type": "static_select",
+                "placeholder": {"type": "plain_text", "text": "緊急度を選択"},
+                "options": [
+                    {"text": {"type": "plain_text", "text": "ノンコア社内タスク"}, "value": "ノンコア社内タスク"},
+                    {"text": {"type": "plain_text", "text": "1週間以内"}, "value": "1週間以内"},
+                    {"text": {"type": "plain_text", "text": "最重要"}, "value": "最重要"},
+                ],
+                "action_id": "urgency_select",
+            },
+            "label": {"type": "plain_text", "text": "緊急度"},
+        },
+        {
+            "type": "section",
+            "block_id": "ai_helper_section",
+            "text": {"type": "mrkdwn", "text": "🤖 *AI補完機能*\nタスクの詳細内容をAIに生成・改良してもらえます"},
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "AI補完", "emoji": True},
+                "value": "ai_enhance",
+                "action_id": "ai_enhance_button",
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "description_block",
+            "element": {
+                "type": "rich_text_input",
+                "action_id": "description_input",
+                "placeholder": {"type": "plain_text", "text": "タスクの詳細を入力（任意）"},
+            },
+            "label": {"type": "plain_text", "text": "内容詳細"},
+            "optional": True,
+        },
+    ]
+    
+    # 初期値を設定
+    if assignee_initial_option:
+        blocks[0]["element"]["initial_option"] = assignee_initial_option
+    if title_initial_value:
+        blocks[1]["element"]["initial_value"] = title_initial_value
+    if due_date_initial:
+        blocks[2]["element"]["initial_date_time"] = due_date_initial
+    if task_type:
+        blocks[3]["element"]["initial_option"] = {"text": {"type": "plain_text", "text": task_type}, "value": task_type}
+    if urgency:
+        blocks[4]["element"]["initial_option"] = {"text": {"type": "plain_text", "text": urgency}, "value": urgency}
+    if description_initial:
+        blocks[7]["element"]["initial_value"] = description_initial
+    
+    return blocks

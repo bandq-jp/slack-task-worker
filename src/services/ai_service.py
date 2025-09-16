@@ -242,22 +242,67 @@ class TaskAIService:
             except concurrent.futures.TimeoutError:
                 raise Exception("AI processing timeout - 処理時間が長すぎます")
     
-    def analyze_task_info(self, session_id: str, task_info: TaskInfo) -> AIAnalysisResult:
+    async def _call_ai_with_timeout_async(self, contents: Union[str, List[types.Content]], timeout: Optional[float] = None) -> str:
+        """非同期でタイムアウト + リトライ付きでAIを呼び出す"""
+        import asyncio
+        effective_timeout = timeout or self.timeout_seconds
+        
+        def call_ai():
+            attempts = self.max_retries
+            last_err: Optional[Exception] = None
+            for i in range(attempts):
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(thinking_budget=0),
+                            max_output_tokens=1000,
+                            temperature=0.2,
+                            system_instruction=self.system_instruction,
+                            response_mime_type="application/json",
+                            response_schema=self._response_schema(),
+                        ),
+                    )
+                    return response.text
+                except Exception as e:
+                    last_err = e
+                    print(f"❌ AI call attempt {i+1}/{attempts} failed: {e}")
+                    if i < attempts - 1:
+                        time.sleep(2 ** i)  # 指数バックオフ
+            raise last_err or Exception("All attempts failed")
+        
+        # 別スレッドで実行して非ブロッキング化
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, call_ai)
+        except asyncio.TimeoutError:
+            raise Exception("AI processing timeout - 処理時間が長すぎます")
+    
+    async def analyze_task_info(self, session_id: str, task_info: TaskInfo) -> AIAnalysisResult:
         """タスク情報を分析"""
         try:
+            print(f"🤖 AI分析開始: session_id={session_id}")
             # 現在のタスク情報をプロンプトに整理
             prompt = self._build_analysis_prompt(task_info)
+            print(f"🔍 プロンプト作成完了: {len(prompt)}文字")
             # 履歴にユーザー発話を追加し、履歴込みのcontentsを構築
             self.history.add_message(session_id, "user", prompt)
             contents = self._build_contents(session_id)
+            print(f"🔍 コンテンツ構築完了: {len(str(contents))}文字")
             # タイムアウト（設定値）付きでGemini APIに送信（構造化JSONを期待）
-            response_text = self._call_ai_with_timeout(contents)
+            print("🔍 Gemini API呼び出し開始...")
+            response_text = await self._call_ai_with_timeout_async(contents)
+            print(f"✅ Gemini API呼び出し完了: {len(response_text)}文字")
             
             # レスポンスを会話履歴に追加
             self.history.add_message(session_id, "model", response_text)
             
             # レスポンスを解析
-            return self._parse_ai_response(response_text)
+            print("🔍 レスポンス解析中...")
+            result = self._parse_ai_response(response_text)
+            print(f"✅ AI分析完了: status={result.status}")
+            return result
             
         except Exception as e:
             print(f"❌ AI analysis error: {e}")
@@ -266,20 +311,25 @@ class TaskAIService:
                 message=f"AI分析でエラーが発生しました: {str(e)}"
             )
     
-    def refine_content(self, session_id: str, feedback: str) -> AIAnalysisResult:
+    async def refine_content(self, session_id: str, feedback: str) -> AIAnalysisResult:
         """ユーザーフィードバックを基にコンテンツを改良"""
         try:
+            print(f"🔄 AI改良開始: session_id={session_id}")
             user_turn = f"以下のフィードバックを反映して改善してください。必要なら不足点も質問してください。\n{feedback}"
             # 履歴にユーザー発話を追加し、履歴込みのcontentsを構築
             self.history.add_message(session_id, "user", user_turn)
             contents = self._build_contents(session_id)
             # タイムアウト（設定値）付きでGemini APIに送信（構造化JSONを期待）
-            response_text = self._call_ai_with_timeout(contents)
+            print("🔍 Gemini API呼び出し開始（改良）...")
+            response_text = await self._call_ai_with_timeout_async(contents)
+            print(f"✅ Gemini API呼び出し完了（改良）: {len(response_text)}文字")
             
             # レスポンスを会話履歴に追加
             self.history.add_message(session_id, "model", response_text)
             
-            return self._parse_ai_response(response_text)
+            result = self._parse_ai_response(response_text)
+            print(f"✅ AI改良完了: status={result.status}")
+            return result
             
         except Exception as e:
             print(f"❌ AI refinement error: {e}")
