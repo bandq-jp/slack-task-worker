@@ -132,30 +132,103 @@ async def handle_interactive(request: Request):
 
         if action_id == "approve_task":
             try:
-                # タスクを承認
-                dto = TaskApprovalDto(
-                    task_id=task_id,
-                    action="approve",
-                    rejection_reason=None,
-                )
-                await task_service.handle_task_approval(dto)
-
-                # メッセージを更新
-                return JSONResponse(
-                    content={
-                        "response_action": "update",
-                        "text": "✅ タスクを承認しました",
-                        "blocks": [
-                            {
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": "✅ このタスクは承認され、Notionに登録されました",
-                                },
+                # 即座にローディング表示（3秒制限回避）
+                loading_response = {
+                    "response_action": "update",
+                    "text": "⏳ タスクを承認中...",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "⏳ *タスクを承認しています...*\n\nしばらくお待ちください。"
                             }
-                        ],
-                    }
-                )
+                        }
+                    ]
+                }
+                
+                # バックグラウンドで承認処理を実行
+                import asyncio
+                
+                async def run_approval():
+                    try:
+                        dto = TaskApprovalDto(
+                            task_id=task_id,
+                            action="approve",
+                            rejection_reason=None,
+                        )
+                        await task_service.handle_task_approval(dto)
+                        print("✅ 承認処理成功")
+                        
+                        # 成功メッセージを表示（チャンネル、TS、メッセージIDが必要）
+                        # Slack メッセージ更新のためのチャンネルとTSを取得
+                        message = payload.get("message", {})
+                        channel = payload.get("channel", {}).get("id")
+                        message_ts = message.get("ts")
+                        
+                        if channel and message_ts:
+                            try:
+                                slack_service.client.chat_update(
+                                    channel=channel,
+                                    ts=message_ts,
+                                    text="✅ タスクを承認しました",
+                                    blocks=[
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": "✅ このタスクは承認され、Notionに登録されました"
+                                            }
+                                        }
+                                    ]
+                                )
+                            except Exception as update_error:
+                                print(f"⚠️ メッセージ更新エラー: {update_error}")
+                                
+                    except Exception as e:
+                        print(f"❌ 承認処理エラー: {e}")
+                        
+                        # エラー時の表示（再試行ボタン付き）
+                        message = payload.get("message", {})
+                        channel = payload.get("channel", {}).get("id")
+                        message_ts = message.get("ts")
+                        
+                        if channel and message_ts:
+                            try:
+                                slack_service.client.chat_update(
+                                    channel=channel,
+                                    ts=message_ts,
+                                    text="❌ 承認処理でエラーが発生しました",
+                                    blocks=[
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": f"❌ *承認処理でエラーが発生しました*\n\n{str(e)}"
+                                            }
+                                        },
+                                        {
+                                            "type": "actions",
+                                            "elements": [
+                                                {
+                                                    "type": "button",
+                                                    "text": {"type": "plain_text", "text": "🔄 再試行"},
+                                                    "style": "primary",
+                                                    "value": task_id,
+                                                    "action_id": "approve_task",
+                                                },
+                                            ]
+                                        }
+                                    ]
+                                )
+                            except Exception as update_error:
+                                print(f"⚠️ エラーメッセージ更新失敗: {update_error}")
+                
+                # 非同期タスクを開始
+                asyncio.create_task(run_approval())
+                
+                # 即座にローディング表示を返す
+                return JSONResponse(content=loading_response)
             except ValueError as e:
                 # エラーメッセージを表示
                 return JSONResponse(
@@ -341,22 +414,112 @@ async def handle_interactive(request: Request):
 
         elif callback_id == "reject_task_modal":
             try:
-                # 差し戻しモーダルの処理
+                # 差し戻しモーダルの処理（非同期化）
                 values = view["state"]["values"]
                 private_metadata = json.loads(view.get("private_metadata", "{}"))
+                view_id = view.get("id")
                 task_id = private_metadata["task_id"]
                 reason = values["reason_block"]["reason_input"]["value"]
 
-                dto = TaskApprovalDto(
-                    task_id=task_id,
-                    action="reject",
-                    rejection_reason=reason,
-                )
-                await task_service.handle_task_approval(dto)
-
+                # 即座にローディング表示
+                loading_view = {
+                    "type": "modal",
+                    "callback_id": "task_rejecting_loading",
+                    "title": {"type": "plain_text", "text": "差し戻し中"},
+                    "close": {"type": "plain_text", "text": "キャンセル"},
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "⏳ *タスクを差し戻しています...*\n\nしばらくお待ちください。"
+                            }
+                        }
+                    ]
+                }
+                
+                # バックグラウンドで差し戻し処理を実行
+                import asyncio
+                
+                async def run_rejection():
+                    try:
+                        dto = TaskApprovalDto(
+                            task_id=task_id,
+                            action="reject",
+                            rejection_reason=reason,
+                        )
+                        await task_service.handle_task_approval(dto)
+                        print("✅ 差し戻し処理成功")
+                        
+                        # 成功時：モーダルを閉じる
+                        if view_id:
+                            try:
+                                success_view = {
+                                    "type": "modal",
+                                    "callback_id": "task_rejected_success",
+                                    "title": {"type": "plain_text", "text": "差し戻し完了"},
+                                    "close": {"type": "plain_text", "text": "閉じる"},
+                                    "blocks": [
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": f"✅ *タスクを差し戻しました*\n\n*理由:* {reason}"
+                                            }
+                                        }
+                                    ]
+                                }
+                                slack_service.client.views_update(view_id=view_id, view=success_view)
+                            except Exception as update_error:
+                                print(f"⚠️ 成功メッセージ表示エラー: {update_error}")
+                                
+                    except Exception as e:
+                        print(f"❌ 差し戻し処理エラー: {e}")
+                        
+                        # エラー時：元のフォームに戻る（値を保持）
+                        if view_id:
+                            try:
+                                error_view = {
+                                    "type": "modal",
+                                    "callback_id": "reject_task_modal",
+                                    "title": {"type": "plain_text", "text": "差し戻し理由"},
+                                    "submit": {"type": "plain_text", "text": "差し戻す"},
+                                    "close": {"type": "plain_text", "text": "キャンセル"},
+                                    "blocks": [
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": f"❌ *エラーが発生しました*\n{str(e)}\n\n下記のフォームで再度お試しください："
+                                            }
+                                        },
+                                        {
+                                            "type": "input",
+                                            "block_id": "reason_block",
+                                            "element": {
+                                                "type": "plain_text_input",
+                                                "multiline": True,
+                                                "action_id": "reason_input",
+                                                "placeholder": {"type": "plain_text", "text": "差し戻し理由を入力してください"},
+                                                "initial_value": reason  # 入力した理由を保持
+                                            },
+                                            "label": {"type": "plain_text", "text": "差し戻し理由"},
+                                        },
+                                    ],
+                                    "private_metadata": json.dumps(private_metadata)
+                                }
+                                slack_service.client.views_update(view_id=view_id, view=error_view)
+                            except Exception as update_error:
+                                print(f"⚠️ エラーメッセージ表示失敗: {update_error}")
+                
+                # 非同期タスクを開始
+                asyncio.create_task(run_rejection())
+                
+                # 即座にローディング画面を返す
                 return JSONResponse(
                     content={
-                        "response_action": "clear",
+                        "response_action": "update",
+                        "view": loading_view
                     }
                 )
             except ValueError as e:
