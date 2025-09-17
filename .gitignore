@@ -11,3 +11,4 @@ wheels/
 .env
 # .user_mapping.json (deprecated - now using dynamic user search)
 .ai_conversations.json
+service_account.json

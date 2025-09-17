@@ -9,9 +9,18 @@ from src.utils.text_converter import convert_rich_text_to_plain_text
 class SlackService:
     """Slack APIサービス"""
 
-    def __init__(self, slack_token: str, slack_bot_token: str):
+    def __init__(self, slack_token: str, slack_bot_token: str, env: str = "local"):
         self.client = WebClient(token=slack_bot_token)
         self.user_client = WebClient(token=slack_token)
+        self.env = env
+
+    @property
+    def app_name_suffix(self) -> str:
+        """環境に応じてアプリ名の接尾辞を返す"""
+        if self.env == "production":
+            return ""
+        else:
+            return " (Dev)"
 
     async def get_user_info(self, user_id: str) -> Dict[str, Any]:
         """ユーザー情報を取得"""
@@ -200,7 +209,7 @@ class SlackService:
             loading_modal = {
                 "type": "modal",
                 "callback_id": "create_task_modal_loading",
-                "title": {"type": "plain_text", "text": "タスク依頼作成"},
+                "title": {"type": "plain_text", "text": f"タスク依頼作成{self.app_name_suffix}"},
                 "close": {"type": "plain_text", "text": "キャンセル"},
                 "blocks": [
                     {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ 初期化中…"}}
@@ -243,7 +252,7 @@ class SlackService:
             full_modal = {
                 "type": "modal",
                 "callback_id": "create_task_modal",
-                "title": {"type": "plain_text", "text": "タスク依頼作成"},
+                "title": {"type": "plain_text", "text": f"タスク依頼作成{self.app_name_suffix}"},
                 "submit": {"type": "plain_text", "text": "作成"},
                 "close": {"type": "plain_text", "text": "キャンセル"},
                 "blocks": [

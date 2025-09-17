@@ -13,6 +13,9 @@ from src.application.services.user_mapping_service import UserMappingApplication
 from src.domain.services.user_mapping_domain_service import UserMappingDomainService
 from src.infrastructure.repositories.task_repository_impl import InMemoryTaskRepository
 from src.infrastructure.repositories.user_repository_impl import InMemoryUserRepository
+from src.infrastructure.google.google_calendar_service import GoogleCalendarService
+from src.infrastructure.repositories.calendar_task_repository_impl import GoogleCalendarTaskRepository
+from src.application.services.calendar_task_service import CalendarTaskApplicationService
 from src.services.ai_service import TaskAIService, TaskInfo, AIAnalysisResult
 from src.utils.text_converter import convert_rich_text_to_plain_text
 from pydantic_settings import BaseSettings
@@ -27,6 +30,8 @@ class Settings(BaseSettings):
     mapping_database_id: str = ""
     gcs_bucket_name: str = ""
     google_application_credentials: str = ""
+    service_account_json: str = ""
+    env: str = "local"
     gemini_api_key: str = ""
     gemini_timeout_seconds: float = 30.0
     gemini_model: str = "gemini-2.5-flash"
@@ -35,6 +40,22 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
+    @property
+    def slack_command_name(self) -> str:
+        """環境に応じてスラッシュコマンド名を返す"""
+        if self.env == "production":
+            return "/task-request"
+        else:
+            return "/task-request-dev"
+
+    @property
+    def app_name_suffix(self) -> str:
+        """環境に応じてアプリ名の接尾辞を返す"""
+        if self.env == "production":
+            return ""
+        else:
+            return " (Dev)"
+
 
 router = APIRouter(prefix="/slack", tags=["slack"])
 settings = Settings()
@@ -42,14 +63,16 @@ settings = Settings()
 # セッション情報を一時的に保存する辞書
 modal_sessions = {}
 
-print("🚀 Dynamic User Mapping System initialized!")
+print("🚀 Slack-Notion Task Management System initialized!")
+print(f"🌍 Environment: {settings.env}")
+print(f"📋 Slack Command: {settings.slack_command_name}{settings.app_name_suffix}")
 print(f"📊 Notion Database: {settings.notion_database_id}")
 print("🔄 Using dynamic user search (no mapping files)")
 
 # リポジトリとサービスのインスタンス化（DDD版DI）
 task_repository = InMemoryTaskRepository()
 user_repository = InMemoryUserRepository()
-slack_service = SlackService(settings.slack_token, settings.slack_bot_token)
+slack_service = SlackService(settings.slack_token, settings.slack_bot_token, settings.env)
 
 # 新しいDDD実装のサービス初期化
 notion_user_repository = NotionUserRepositoryImpl(
@@ -88,6 +111,24 @@ task_service = TaskApplicationService(
     notion_service=notion_service,
 )
 
+# Google Calendar サービスの初期化（オプショナル）
+calendar_task_service = None
+if settings.service_account_json:
+    try:
+        google_calendar_service = GoogleCalendarService(
+            service_account_json=settings.service_account_json,
+            env=settings.env
+        )
+        calendar_task_repository = GoogleCalendarTaskRepository(google_calendar_service)
+        calendar_task_service = CalendarTaskApplicationService(
+            calendar_task_repository=calendar_task_repository,
+            user_mapping_service=user_mapping_service
+        )
+        print("✅ Google Calendar integration initialized")
+    except Exception as e:
+        print(f"⚠️ Google Calendar initialization failed: {e}")
+        print("   Calendar integration will be disabled")
+
 
 @router.post("/commands")
 async def handle_slash_command(request: Request):
@@ -97,7 +138,7 @@ async def handle_slash_command(request: Request):
     trigger_id = form.get("trigger_id")
     user_id = form.get("user_id")
 
-    if command == "/task-request":
+    if command == settings.slack_command_name:
         # タスク作成モーダルを開く（即時ACK + バックグラウンドで続行）
         import asyncio
         asyncio.create_task(slack_service.open_task_modal(trigger_id, user_id))
@@ -159,7 +200,32 @@ async def handle_interactive(request: Request):
                         )
                         await task_service.handle_task_approval(dto)
                         print("✅ 承認処理成功")
-                        
+
+                        # Google Calendar にタスクを追加（オプショナル）
+                        calendar_status = ""
+                        if calendar_task_service:
+                            try:
+                                # タスク情報を取得（Notionから）
+                                task_data = await notion_service.get_task_by_id(task_id)
+                                if task_data:
+                                    # 承認者のSlack IDを取得
+                                    approver_slack_id = payload.get("user", {}).get("id")
+
+                                    # カレンダータスクを作成
+                                    calendar_task = await calendar_task_service.create_task_on_approval(
+                                        task_data=task_data,
+                                        approver_slack_user_id=approver_slack_id
+                                    )
+
+                                    if calendar_task:
+                                        calendar_status = "\n📅 Googleカレンダーのタスクに追加しました"
+                                        print("✅ Google Calendar task created")
+                                    else:
+                                        calendar_status = "\n⚠️ Googleカレンダーへの追加はスキップされました（メールアドレスが見つかりません）"
+                            except Exception as cal_error:
+                                print(f"⚠️ Calendar task creation error: {cal_error}")
+                                calendar_status = "\n⚠️ Googleカレンダーへの追加に失敗しました"
+
                         # 成功メッセージを表示（チャンネル、TS、メッセージIDが必要）
                         # Slack メッセージ更新のためのチャンネルとTSを取得
                         message = payload.get("message", {})
@@ -177,7 +243,7 @@ async def handle_interactive(request: Request):
                                             "type": "section",
                                             "text": {
                                                 "type": "mrkdwn",
-                                                "text": "✅ このタスクは承認され、Notionに登録されました"
+                                                "text": f"✅ このタスクは承認され、Notionに登録されました{calendar_status}"
                                             }
                                         }
                                     ]

@@ -532,6 +532,92 @@ class DynamicNotionService:
         }
         return status_map.get(status, "承認待ち")
 
+    async def get_task_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """タスクIDでNotionページを取得
+
+        Args:
+            task_id: NotionページID
+
+        Returns:
+            タスク情報の辞書。以下の項目を含む:
+            - id: ページID
+            - title: タイトル
+            - content: 内容
+            - due_date: 納期
+            - requester_name: 依頼者名
+            - assignee_name: 依頼先名
+            - notion_url: NotionページのURL
+            - status: ステータス
+        """
+        try:
+            # ページ情報を取得
+            page = self.client.pages.retrieve(page_id=task_id)
+            properties = page.get("properties", {})
+
+            # プロパティから情報を抽出
+            title = ""
+            if "タイトル" in properties and properties["タイトル"]["title"]:
+                title = properties["タイトル"]["title"][0]["text"]["content"]
+
+            due_date = None
+            if "納期" in properties and properties["納期"].get("date"):
+                due_date = properties["納期"]["date"]["start"]
+
+            requester_name = ""
+            if "依頼者" in properties and properties["依頼者"].get("people"):
+                people = properties["依頼者"]["people"]
+                if people:
+                    # ユーザー情報を取得
+                    user_id = people[0]["id"]
+                    try:
+                        user = self.client.users.retrieve(user_id=user_id)
+                        requester_name = user.get("name", "")
+                    except Exception:
+                        requester_name = "不明"
+
+            assignee_name = ""
+            if "依頼先" in properties and properties["依頼先"].get("people"):
+                people = properties["依頼先"]["people"]
+                if people:
+                    # ユーザー情報を取得
+                    user_id = people[0]["id"]
+                    try:
+                        user = self.client.users.retrieve(user_id=user_id)
+                        assignee_name = user.get("name", "")
+                    except Exception:
+                        assignee_name = "不明"
+
+            status = ""
+            if "ステータス" in properties and properties["ステータス"].get("select"):
+                status = properties["ステータス"]["select"]["name"]
+
+            # ページコンテンツを取得
+            content_blocks = self.client.blocks.children.list(block_id=task_id)
+            content = ""
+            for block in content_blocks.get("results", []):
+                if block["type"] == "paragraph" and block.get("paragraph", {}).get("rich_text"):
+                    for rich_text in block["paragraph"]["rich_text"]:
+                        if rich_text["type"] == "text":
+                            content += rich_text["text"]["content"] + "\n"
+
+            # Notion URLを生成
+            notion_url = page.get("url", f"https://www.notion.so/{task_id.replace('-', '')}")
+
+            return {
+                "id": task_id,
+                "title": title,
+                "content": content.strip(),
+                "due_date": due_date,
+                "requester_name": requester_name,
+                "assignee_name": assignee_name,
+                "notion_url": notion_url,
+                "status": status,
+            }
+
+        except Exception as e:
+            print(f"Error getting task from Notion: {e}")
+            return None
+
     async def update_task_status(
         self,
         page_id: str,

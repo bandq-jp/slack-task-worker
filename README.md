@@ -27,6 +27,19 @@ slack-test/
 
 詳細な構造については [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) を参照してください。
 
+## 🌍 環境分離設定
+
+このシステムは本番環境とローカル開発環境を完全に分離して運用できます：
+
+| 項目 | 本番環境 | 開発環境 |
+|------|----------|----------|
+| **Slashコマンド** | `/task-request` | `/task-request-dev` |
+| **アプリ名** | Task Request Bot | Task Request Bot (Dev) |
+| **モーダルタイトル** | タスク依頼作成 | タスク依頼作成 (Dev) |
+| **環境変数** | `ENV=production` | `ENV=local` |
+
+**重要**: 本番と開発で異なるSlack Appを作成することを強く推奨します。
+
 ## ⚡ クイックスタート
 
 ### 1. 環境変数設定
@@ -35,6 +48,12 @@ slack-test/
 
 ```bash
 cp .env.example .env
+```
+
+**重要**: 開発環境では `ENV=local` を設定してください：
+```bash
+# .env ファイル内
+ENV=local
 ```
 
 ### 2. 依存関係インストール
@@ -80,7 +99,9 @@ python tests/test_complete_workflow.py
 
 ## 🎯 使用フロー
 
-1. Slackで `/task-request` コマンド実行
+1. Slackでコマンド実行（環境により異なる）
+   - 本番環境: `/task-request`
+   - 開発環境: `/task-request-dev`
 2. モーダルフォームで入力：
    - 依頼先Slackユーザー選択
    - タスクタイトル
