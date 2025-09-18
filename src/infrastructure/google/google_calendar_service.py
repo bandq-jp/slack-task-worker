@@ -69,6 +69,10 @@ class GoogleCalendarService:
             作成されたタスクの情報
         """
         try:
+            print(f"📅 Creating Google Calendar task for: {user_email}")
+            print(f"   Title: {title}")
+            print(f"   Due date: {due_date}")
+
             # ユーザーにタスクリストへのアクセス権を委譲
             delegated_credentials = self.credentials.with_subject(user_email)
             tasks_service = build('tasks', 'v1', credentials=delegated_credentials)
@@ -86,17 +90,34 @@ class GoogleCalendarService:
                 # RFC 3339形式に変換
                 task_body['due'] = due_date.isoformat() + 'Z'
 
+            print(f"📝 Task body: {task_body}")
+
             # タスクを作成
             task = tasks_service.tasks().insert(
                 tasklist=tasklist_id,
                 body=task_body
             ).execute()
 
-            print(f"✅ Task created for {user_email}: {task.get('id')}")
+            print(f"✅ Google Calendar task created successfully for {user_email}: {task.get('id')}")
             return task
 
         except HttpError as error:
-            print(f"❌ Error creating task for {user_email}: {error}")
+            error_details = error.resp if hasattr(error, 'resp') else str(error)
+            print(f"❌ Google Calendar API Error for {user_email}:")
+            print(f"   Status: {error.resp.status if hasattr(error, 'resp') else 'Unknown'}")
+            print(f"   Reason: {error.resp.reason if hasattr(error, 'resp') else 'Unknown'}")
+            print(f"   Details: {error_details}")
+
+            if hasattr(error, 'resp') and error.resp.status == 403:
+                print("🔒 Permission denied. Please check:")
+                print("   1. Domain-wide delegation is properly configured")
+                print("   2. Service account has the correct scopes")
+                print("   3. User email exists in Google Workspace")
+                print("   4. User has Google Tasks enabled")
+
+            raise Exception(f"Google Calendar API error: {error}")
+        except Exception as error:
+            print(f"❌ Unexpected error creating Google Calendar task for {user_email}: {error}")
             raise
 
     def create_calendar_event(self,

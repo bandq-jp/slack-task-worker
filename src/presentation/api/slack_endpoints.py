@@ -205,23 +205,33 @@ async def handle_interactive(request: Request):
                         calendar_status = ""
                         if calendar_task_service:
                             try:
-                                # タスク情報を取得（Notionから）
-                                task_data = await notion_service.get_task_by_id(task_id)
-                                if task_data:
-                                    # 承認者のSlack IDを取得
-                                    approver_slack_id = payload.get("user", {}).get("id")
+                                # まずTaskRequestを取得してnotion_page_idを確認
+                                saved_task = await task_service.task_repository.find_by_id(task_id)
+                                if saved_task and saved_task.notion_page_id:
+                                    print(f"🔍 TaskRequest found: {task_id}, notion_page_id: {saved_task.notion_page_id}")
+                                    # Notionからタスク情報を取得
+                                    task_data = await notion_service.get_task_by_id(saved_task.notion_page_id)
+                                    if task_data:
+                                        # 承認者のSlack IDを取得
+                                        approver_slack_id = payload.get("user", {}).get("id")
 
-                                    # カレンダータスクを作成
-                                    calendar_task = await calendar_task_service.create_task_on_approval(
-                                        task_data=task_data,
-                                        approver_slack_user_id=approver_slack_id
-                                    )
+                                        # カレンダータスクを作成
+                                        calendar_task = await calendar_task_service.create_task_on_approval(
+                                            task_data=task_data,
+                                            approver_slack_user_id=approver_slack_id
+                                        )
 
-                                    if calendar_task:
-                                        calendar_status = "\n📅 Googleカレンダーのタスクに追加しました"
-                                        print("✅ Google Calendar task created")
+                                        if calendar_task:
+                                            calendar_status = "\n📅 Googleカレンダーのタスクに追加しました"
+                                            print("✅ Google Calendar task created")
+                                        else:
+                                            calendar_status = "\n⚠️ Googleカレンダーへの追加はスキップされました（メールアドレスが見つかりません）"
                                     else:
-                                        calendar_status = "\n⚠️ Googleカレンダーへの追加はスキップされました（メールアドレスが見つかりません）"
+                                        calendar_status = "\n⚠️ Notionからタスクデータを取得できませんでした"
+                                        print(f"⚠️ Could not get task data from Notion for page_id: {saved_task.notion_page_id}")
+                                else:
+                                    calendar_status = "\n⚠️ タスクまたはNotionページIDが見つかりません"
+                                    print(f"⚠️ TaskRequest not found or missing notion_page_id: task_id={task_id}")
                             except Exception as cal_error:
                                 print(f"⚠️ Calendar task creation error: {cal_error}")
                                 calendar_status = "\n⚠️ Googleカレンダーへの追加に失敗しました"
