@@ -82,13 +82,30 @@ class GoogleCalendarService:
 
             # タスクのボディを構築
             task_body = {
-                'title': title,
-                'notes': notes,
+                'title': title[:1024] if title else "タスク",  # タイトルは1024文字制限
             }
 
+            # notesは文字数制限と改行処理
+            if notes:
+                # 改行を統一し、文字数制限を適用
+                clean_notes = notes.replace('\r\n', '\n').replace('\r', '\n')
+                task_body['notes'] = clean_notes[:8192]  # 8192文字制限
+
             if due_date:
-                # RFC 3339形式に変換
-                task_body['due'] = due_date.isoformat() + 'Z'
+                # Google Tasks API用の正しい日付フォーマット
+                try:
+                    if hasattr(due_date, 'date'):
+                        # datetimeオブジェクトの場合は日付部分のみ使用
+                        due_date_only = due_date.date()
+                    else:
+                        due_date_only = due_date
+
+                    # Google Tasks APIは日付のみを受け取る（RFC 3339形式）
+                    task_body['due'] = due_date_only.strftime('%Y-%m-%dT00:00:00.000Z')
+
+                except Exception as date_error:
+                    print(f"⚠️ Date formatting error: {date_error}")
+                    # 日付設定に失敗した場合はdue dateなしで作成
 
             print(f"📝 Task body: {task_body}")
 
@@ -108,7 +125,17 @@ class GoogleCalendarService:
             print(f"   Reason: {error.resp.reason if hasattr(error, 'resp') else 'Unknown'}")
             print(f"   Details: {error_details}")
 
-            if hasattr(error, 'resp') and error.resp.status == 403:
+            # エラー内容を詳しく出力
+            if hasattr(error, 'content'):
+                print(f"   Error content: {error.content}")
+
+            if hasattr(error, 'resp') and error.resp.status == 400:
+                print("🔧 Bad Request Error. Possible causes:")
+                print("   1. Invalid date format in request")
+                print("   2. Request body contains invalid fields")
+                print("   3. Field length exceeds API limits")
+                print(f"   4. Task body sent: {task_body}")
+            elif hasattr(error, 'resp') and error.resp.status == 403:
                 print("🔒 Permission denied. Please check:")
                 print("   1. Domain-wide delegation is properly configured")
                 print("   2. Service account has the correct scopes")
