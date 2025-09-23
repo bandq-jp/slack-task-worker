@@ -8,6 +8,7 @@ SlackからNotionへのタスク管理システム。DDD/Clean Architectureを�
 - リッチテキスト対応のモーダルフォーム
 - 依頼先ユーザーにDMで承認・差し戻しボタン送信
 - 即座にNotionデータベースにタスク保存
+- Notionの納期に応じた自動リマインド（期日前・当日・超過）と既読／延期ワークフロー
 - ゲストユーザー対応の高速ユーザーマッピング
 - 承認・差し戻し時にNotionのステータス更新
 
@@ -173,6 +174,32 @@ gcloud run deploy slack-notion-task \
   --allow-unauthenticated \
   --set-env-vars "SLACK_BOT_TOKEN=xxx,NOTION_TOKEN=xxx,..."
 ```
+
+## ⏰ 自動リマインド運用
+
+1. NotionのタスクDBにリマインド／延期用プロパティを追加し、監査ログデータベースを作成する（`docs/NOTION_SETUP.md`参照）。
+2. Cloud Runサービスのエンドポイント `POST /slack/cron/run-reminders` に対して Cloud Scheduler で毎時リクエストを送信する。
+
+```bash
+gcloud scheduler jobs create http task-reminder-hourly \
+  --schedule="0 * * * *" \
+  --http-method=POST \
+  --uri="https://<your-cloud-run-url>/slack/cron/run-reminders" \
+  --headers="Content-Type=application/json" \
+  --body='{"source":"scheduler"}' \
+  --oidc-service-account-email=<service-account>@<project>.iam.gserviceaccount.com
+```
+
+3. ローカル検証中は Cloud Scheduler の代わりに以下を叩いて挙動を確認できます。
+
+```bash
+curl -X POST http://localhost:8000/slack/cron/run-reminders \
+  -H "Content-Type: application/json" \
+  -d '{"source": "manual"}'
+```
+
+4. Cloud Runのログで `checked` / `notified` 件数を確認し、Slackにリマインドが届くことを確認する。
+5. 延期が承認された場合はNotionの納期が更新されるため、次回以降のリマインドは自動的に新期日を基準に計算されます。
 
 ## 📊 機能一覧
 
