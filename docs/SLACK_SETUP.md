@@ -1,5 +1,14 @@
 # Slack App セットアップガイド
 
+## 重要: 環境分離について
+
+このシステムは本番環境とローカル開発環境を分離して運用できます：
+
+- **本番環境**: `/task-request` コマンド、"Task Request Bot"
+- **開発環境**: `/task-request-dev` コマンド、"Task Request Bot (Dev)"
+
+**本番とローカルで異なるSlackアプリを作成することを強く推奨します。**
+
 ## 1. Slack App の作成
 
 ### Step 1: 基本的なmanifestでアプリを作成
@@ -7,8 +16,9 @@
 1. https://api.slack.com/apps にアクセス
 2. 「Create New App」→「From an app manifest」を選択
 3. ワークスペースを選択
-4. 以下の基本manifestをコピーして貼り付け：
+4. 環境に応じて以下のmanifestを使用：
 
+#### 本番環境用 manifest:
 ```json
 {
     "display_information": {
@@ -28,6 +38,40 @@
                 "chat:write",
                 "im:write",
                 "users:read",
+                "users:read.email",
+                "commands"
+            ]
+        }
+    },
+    "settings": {
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": false,
+        "token_rotation_enabled": false
+    }
+}
+```
+
+#### 開発環境用 manifest:
+```json
+{
+    "display_information": {
+        "name": "Task Request Bot (Dev)",
+        "description": "SlackとNotionを連携したタスク依頼管理システム（開発環境）",
+        "background_color": "#ff6b00"
+    },
+    "features": {
+        "bot_user": {
+            "display_name": "Task Request Bot (Dev)",
+            "always_online": true
+        }
+    },
+    "oauth_config": {
+        "scopes": {
+            "bot": [
+                "chat:write",
+                "im:write",
+                "users:read",
+                "users:read.email",
                 "commands"
             ]
         }
@@ -78,13 +122,27 @@ ngrok http 8000
 表示されるHTTPS URLをコピー（例: `https://abc123.ngrok.io`）
 
 ### Step 4: Slash Commandsの追加
+
+**重要**: 環境に応じて異なるコマンド名を使用してください
+
+#### 本番環境の場合:
 1. 左サイドバーの「Slash Commands」をクリック
 2. 「Create New Command」をクリック
 3. 以下を入力：
    - Command: `/task-request`
-   - Request URL: `https://your-ngrok-url.ngrok.io/slack/commands`
+   - Request URL: `https://your-production-url.com/slack/commands`
    - Short Description: `新しいタスク依頼を作成`
    - Usage Hint: `タスク依頼フォームを開きます`
+4. 「Save」をクリック
+
+#### 開発環境の場合:
+1. 左サイドバーの「Slash Commands」をクリック
+2. 「Create New Command」をクリック
+3. 以下を入力：
+   - Command: `/task-request-dev`
+   - Request URL: `https://your-ngrok-url.ngrok.io/slack/commands`
+   - Short Description: `新しいタスク依頼を作成 (Dev)`
+   - Usage Hint: `タスク依頼フォームを開きます（開発環境）`
 4. 「Save」をクリック
 
 ### Step 5: Interactivityの設定
@@ -95,17 +153,41 @@ ngrok http 8000
 
 ## 4. 環境変数の設定
 
-`.env`ファイルを作成：
+### 開発環境用 `.env`ファイル:
 
 ```bash
-# Slack Configuration
-SLACK_TOKEN=xoxp-your-user-token（オプション）
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_SIGNING_SECRET=your-signing-secret
+# Environment
+ENV=local
 
-# Notion Configuration（後で設定）
+# Slack Configuration (Development App)
+SLACK_TOKEN=xoxp-your-dev-user-token（オプション）
+SLACK_BOT_TOKEN=xoxb-your-dev-bot-token
+SLACK_SIGNING_SECRET=your-dev-signing-secret
+
+# Notion Configuration
 NOTION_TOKEN=secret_your-notion-token
 NOTION_DATABASE_ID=your-database-id
+
+# Google Calendar Integration (オプショナル)
+SERVICE_ACCOUNT_JSON=./secrets/service-account.json
+```
+
+### 本番環境用環境変数:
+
+```bash
+# Environment
+ENV=production
+
+# Slack Configuration (Production App)
+SLACK_BOT_TOKEN=xoxb-your-production-bot-token
+SLACK_SIGNING_SECRET=your-production-signing-secret
+
+# Notion Configuration
+NOTION_TOKEN=secret_your-production-notion-token
+NOTION_DATABASE_ID=your-production-database-id
+
+# Google Calendar Integration (オプショナル)
+SERVICE_ACCOUNT_JSON="{"type":"service_account",...}" # JSON文字列
 ```
 
 ## 5. アプリケーションの起動
@@ -120,10 +202,26 @@ ngrok http 8000
 
 ## 6. 動作確認
 
-1. Slackワークスペースで `/task-request` と入力
-2. モーダルが表示されることを確認
+### 開発環境:
+1. Slackワークスペースで `/task-request-dev` と入力
+2. "タスク依頼作成 (Dev)" モーダルが表示されることを確認
 3. タスク情報を入力して送信
 4. 依頼先にDMが送信されることを確認
+
+### 本番環境:
+1. Slackワークスペースで `/task-request` と入力
+2. "タスク依頼作成" モーダルが表示されることを確認
+3. タスク情報を入力して送信
+4. 依頼先にDMが送信されることを確認
+
+## 7. 環境分離の効果
+
+この設定により以下の効果があります：
+
+- ✅ 開発時に本番データを誤って変更するリスクを排除
+- ✅ スラッシュコマンドの競合を回避
+- ✅ 開発環境と本番環境の明確な識別
+- ✅ 異なるNotionデータベースや設定の使用が可能
 
 ## トラブルシューティング
 

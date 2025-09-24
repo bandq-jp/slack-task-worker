@@ -1,7 +1,9 @@
 import json
 import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Union
-from datetime import datetime
 from notion_client import Client
 from src.domain.entities.task import TaskRequest
 from src.domain.entities.notion_user import NotionUser
@@ -9,22 +11,141 @@ from src.application.services.user_mapping_service import UserMappingApplication
 from src.utils.text_converter import convert_rich_text_to_plain_text
 
 
+REMINDER_STAGE_NOT_SENT = "未送信"
+REMINDER_STAGE_BEFORE = "期日前"
+REMINDER_STAGE_DUE = "当日"
+REMINDER_STAGE_OVERDUE = "超過"
+REMINDER_STAGE_ACKED = "既読"
+
+EXTENSION_STATUS_NONE = "なし"
+EXTENSION_STATUS_PENDING = "申請中"
+EXTENSION_STATUS_APPROVED = "承認済"
+EXTENSION_STATUS_REJECTED = "却下"
+
+COMPLETION_STATUS_IN_PROGRESS = "進行中"
+COMPLETION_STATUS_REQUESTED = "完了申請中"
+COMPLETION_STATUS_APPROVED = "完了承認"
+COMPLETION_STATUS_REJECTED = "完了却下"
+
+EXCLUDED_STATUSES_FOR_REMINDER = {"差し戻し", "完了", "無効"}
+
+TASK_PROP_TITLE = "タイトル"
+TASK_PROP_DUE = "納期"
+TASK_PROP_STATUS = "ステータス"
+TASK_PROP_REQUESTER = "依頼者"
+TASK_PROP_ASSIGNEE = "依頼先"
+TASK_PROP_REMINDER_STAGE = "リマインドフェーズ"
+TASK_PROP_REMINDER_READ = "リマインド既読"
+TASK_PROP_LAST_REMIND_AT = "最終リマインド日時"
+TASK_PROP_LAST_READ_AT = "最終既読日時"
+TASK_PROP_EXTENSION_STATUS = "延期ステータス"
+TASK_PROP_EXTENSION_DUE = "延期期日（申請中）"
+TASK_PROP_EXTENSION_REASON = "延期理由（申請中）"
+TASK_PROP_OVERDUE_POINTS = "納期超過ポイント"
+
+TASK_PROP_COMPLETION_STATUS = "完了ステータス"
+TASK_PROP_COMPLETION_REQUESTED_AT = "完了申請日時"
+TASK_PROP_COMPLETION_APPROVED_AT = "完了承認日時"
+TASK_PROP_COMPLETION_NOTE = "完了報告メモ"
+TASK_PROP_COMPLETION_REJECT_REASON = "完了却下理由"
+
+AUDIT_PROP_TITLE = "イベント"
+AUDIT_PROP_EVENT_TYPE = "種別"
+AUDIT_PROP_TASK_RELATION = "関連タスク"
+AUDIT_PROP_DETAIL = "詳細"
+AUDIT_PROP_ACTOR = "実施者"
+AUDIT_PROP_OCCURRED_AT = "日時"
+
+
+@dataclass
+class NotionTaskSnapshot:
+    page_id: str
+    title: str
+    due_date: Optional[datetime]
+    status: Optional[str]
+    requester_email: Optional[str]
+    requester_notion_id: Optional[str]
+    assignee_email: Optional[str]
+    assignee_notion_id: Optional[str]
+    reminder_stage: Optional[str]
+    reminder_last_sent_at: Optional[datetime]
+    reminder_read: bool
+    reminder_read_at: Optional[datetime]
+    extension_status: Optional[str]
+    extension_requested_due: Optional[datetime]
+    extension_reason: Optional[str]
+    overdue_points: int
+    completion_status: Optional[str]
+    completion_requested_at: Optional[datetime]
+    completion_note: Optional[str]
+    completion_approved_at: Optional[datetime]
+    completion_reject_reason: Optional[str]
+
+
 class DynamicNotionService:
     """動的ユーザー検索対応のNotion APIサービス（DDD版）"""
 
     def __init__(
-        self, 
-        notion_token: str, 
+        self,
+        notion_token: str,
         database_id: str,
-        user_mapping_service: UserMappingApplicationService
+        user_mapping_service: UserMappingApplicationService,
+        audit_database_id: Optional[str] = None,
     ):
         self.client = Client(auth=notion_token)
         self.database_id = self._normalize_database_id(database_id)
         self.user_mapping_service = user_mapping_service
+        self.audit_database_id = (
+            self._normalize_database_id(audit_database_id)
+            if audit_database_id
+            else None
+        )
 
     def _normalize_database_id(self, database_id: str) -> str:
         """データベースIDを正規化（ハイフンを削除）"""
         return database_id.replace("-", "")
+
+    def _parse_datetime(self, date_payload: Optional[Dict[str, Any]]) -> Optional[datetime]:
+        if not date_payload:
+            return None
+        start = date_payload.get("start")
+        if not start:
+            return None
+        try:
+            normalized = start.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+
+    def _format_datetime(self, value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+
+    def _extract_rich_text(self, prop: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not prop:
+            return None
+        rich_text_items = prop.get("rich_text", [])
+        if not rich_text_items:
+            return None
+        texts: List[str] = []
+        for item in rich_text_items:
+            text = item.get("plain_text") or item.get("text", {}).get("content")
+            if text:
+                texts.append(text)
+        return "".join(texts) if texts else None
+
+    def _extract_people(self, prop: Optional[Dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+        """Return first person's (notion_user_id, email)"""
+        if not prop:
+            return None, None
+        people = prop.get("people", [])
+        if not people:
+            return None, None
+        first = people[0]
+        notion_id = first.get("id")
+        email = first.get("person", {}).get("email") or first.get("person", {}).get("email_address")
+        return notion_id, email
 
     def _convert_slack_rich_text_to_notion(self, description: Union[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """SlackリッチテキストをNotionブロック形式に変換"""
@@ -310,7 +431,7 @@ class DynamicNotionService:
 
             # Notionページのプロパティを構築（詳細はページ本文に記載）
             properties = {
-                "タイトル": {
+                TASK_PROP_TITLE: {
                     "title": [
                         {
                             "text": {
@@ -319,12 +440,12 @@ class DynamicNotionService:
                         },
                     ],
                 },
-                "納期": {
+                TASK_PROP_DUE: {
                     "date": {
                         "start": task.due_date.isoformat(),
                     },
                 },
-                "ステータス": {
+                TASK_PROP_STATUS: {
                     "select": {
                         "name": self._get_status_name(task.status.value),
                     },
@@ -338,6 +459,24 @@ class DynamicNotionService:
                     "select": {
                         "name": task.urgency,
                     },
+                },
+                TASK_PROP_REMINDER_STAGE: {
+                    "select": {"name": REMINDER_STAGE_NOT_SENT},
+                },
+                TASK_PROP_REMINDER_READ: {
+                    "checkbox": False,
+                },
+                TASK_PROP_OVERDUE_POINTS: {
+                    "number": 0,
+                },
+                TASK_PROP_EXTENSION_STATUS: {
+                    "select": {"name": EXTENSION_STATUS_NONE},
+                },
+                TASK_PROP_COMPLETION_STATUS: {
+                    "select": {"name": COMPLETION_STATUS_IN_PROGRESS},
+                },
+                TASK_PROP_COMPLETION_NOTE: {
+                    "rich_text": [],
                 },
             }
 
@@ -532,6 +671,597 @@ class DynamicNotionService:
         }
         return status_map.get(status, "承認待ち")
 
+    async def get_task_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """タスクIDでNotionページを取得
+
+        Args:
+            task_id: NotionページID
+
+        Returns:
+            タスク情報の辞書。以下の項目を含む:
+            - id: ページID
+            - title: タイトル
+            - content: 内容
+            - due_date: 納期
+            - requester_name: 依頼者名
+            - assignee_name: 依頼先名
+            - notion_url: NotionページのURL
+            - status: ステータス
+        """
+        try:
+            # ページ情報を取得
+            page = self.client.pages.retrieve(page_id=task_id)
+            properties = page.get("properties", {})
+
+            # プロパティから情報を抽出
+            title = ""
+            if "タイトル" in properties and properties["タイトル"]["title"]:
+                title = properties["タイトル"]["title"][0]["text"]["content"]
+
+            due_date = None
+            if "納期" in properties and properties["納期"].get("date"):
+                due_date = properties["納期"]["date"]["start"]
+
+            requester_name = ""
+            if "依頼者" in properties and properties["依頼者"].get("people"):
+                people = properties["依頼者"]["people"]
+                if people:
+                    # ユーザー情報を取得
+                    user_id = people[0]["id"]
+                    try:
+                        user = self.client.users.retrieve(user_id=user_id)
+                        requester_name = user.get("name", "")
+                    except Exception:
+                        requester_name = "不明"
+
+            assignee_name = ""
+            if "依頼先" in properties and properties["依頼先"].get("people"):
+                people = properties["依頼先"]["people"]
+                if people:
+                    # ユーザー情報を取得
+                    user_id = people[0]["id"]
+                    try:
+                        user = self.client.users.retrieve(user_id=user_id)
+                        assignee_name = user.get("name", "")
+                    except Exception:
+                        assignee_name = "不明"
+
+            status = ""
+            if "ステータス" in properties and properties["ステータス"].get("select"):
+                status = properties["ステータス"]["select"]["name"]
+
+            # ページコンテンツを取得
+            content_blocks = self.client.blocks.children.list(block_id=task_id)
+            content = ""
+            for block in content_blocks.get("results", []):
+                if block["type"] == "paragraph" and block.get("paragraph", {}).get("rich_text"):
+                    for rich_text in block["paragraph"]["rich_text"]:
+                        if rich_text["type"] == "text":
+                            content += rich_text["text"]["content"] + "\n"
+
+            # Notion URLを生成
+            notion_url = page.get("url", f"https://www.notion.so/{task_id.replace('-', '')}")
+
+            return {
+                "id": task_id,
+                "title": title,
+                "content": content.strip(),
+                "due_date": due_date,
+                "requester_name": requester_name,
+                "assignee_name": assignee_name,
+                "notion_url": notion_url,
+                "status": status,
+            }
+
+        except Exception as e:
+            print(f"Error getting task from Notion: {e}")
+            return None
+
+    async def fetch_active_tasks(self) -> List[NotionTaskSnapshot]:
+        """リマインド対象となり得るタスク一覧を取得"""
+        results: List[NotionTaskSnapshot] = []
+        has_more = True
+        start_cursor = None
+
+        filter_conditions: List[Dict[str, Any]] = [
+            {
+                "property": TASK_PROP_DUE,
+                "date": {"is_not_empty": True},
+            }
+        ]
+
+        for status in EXCLUDED_STATUSES_FOR_REMINDER:
+            filter_conditions.append(
+                {
+                    "property": TASK_PROP_STATUS,
+                    "select": {"does_not_equal": status},
+                }
+            )
+
+        while has_more:
+            query_payload: Dict[str, Any] = {
+                "database_id": self.database_id,
+                "page_size": 100,
+                "filter": {"and": filter_conditions},
+                "sorts": [
+                    {
+                        "property": TASK_PROP_DUE,
+                        "direction": "ascending",
+                    }
+                ],
+            }
+
+            if start_cursor:
+                query_payload["start_cursor"] = start_cursor
+
+            response = self.client.databases.query(**query_payload)
+            for page in response.get("results", []):
+                try:
+                    snapshot = self._to_snapshot(page)
+                    if snapshot.due_date:
+                        results.append(snapshot)
+                except Exception as exc:
+                    print(f"⚠️ Failed to parse Notion task snapshot: {exc}")
+
+            has_more = response.get("has_more", False)
+            start_cursor = response.get("next_cursor")
+
+        return results
+
+    async def get_task_snapshot(self, page_id: str) -> Optional[NotionTaskSnapshot]:
+        try:
+            page = self.client.pages.retrieve(page_id=page_id)
+            return self._to_snapshot(page)
+        except Exception as exc:
+            print(f"⚠️ Failed to get Notion task snapshot: {exc}")
+            return None
+
+    async def record_audit_log(
+        self,
+        task_page_id: str,
+        event_type: str,
+        detail: str,
+        actor_email: Optional[str] = None,
+    ) -> Optional[str]:
+        if not self.audit_database_id:
+            print("⚠️ Audit database ID is not configured; skipping log entry.")
+            return None
+
+        properties: Dict[str, Any] = {
+            AUDIT_PROP_TITLE: {
+                "title": [
+                    {
+                        "text": {
+                            "content": f"{event_type} - {datetime.now(JST).strftime('%Y/%m/%d %H:%M')}"
+                        }
+                    }
+                ]
+            },
+            AUDIT_PROP_EVENT_TYPE: {
+                "select": {"name": event_type}
+            },
+            AUDIT_PROP_TASK_RELATION: {
+                "relation": [{"id": task_page_id}]
+            },
+            AUDIT_PROP_DETAIL: {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": detail[:2000]},
+                    }
+                ]
+            },
+            AUDIT_PROP_OCCURRED_AT: {
+                "date": {
+                    "start": self._format_datetime(datetime.now(JST))
+                }
+            },
+        }
+
+        if actor_email:
+            notion_user = await self.user_mapping_service.find_notion_user_by_email(actor_email)
+            if notion_user:
+                properties[AUDIT_PROP_ACTOR] = {
+                    "people": [
+                        {
+                            "object": "user",
+                            "id": str(notion_user.user_id),
+                        }
+                    ]
+                }
+
+        try:
+            response = self.client.pages.create(
+                parent={"database_id": self.audit_database_id},
+                properties=properties,
+            )
+            return response.get("id")
+        except Exception as exc:
+            print(f"⚠️ Failed to create audit log entry: {exc}")
+            return None
+
+    async def update_reminder_state(
+        self,
+        page_id: str,
+        stage: str,
+        reminder_time: datetime,
+    ) -> None:
+        properties = {
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": stage},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": False,
+            },
+            TASK_PROP_LAST_REMIND_AT: {
+                "date": {"start": self._format_datetime(reminder_time)},
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": None,
+            },
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to update reminder state in Notion: {exc}")
+
+    async def mark_reminder_read(
+        self,
+        page_id: str,
+        read_time: datetime,
+        stage: Optional[str] = None,
+    ) -> None:
+        selected_stage = stage or REMINDER_STAGE_ACKED
+        properties = {
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": selected_stage},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": True,
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": {"start": self._format_datetime(read_time)},
+            },
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to mark reminder as read: {exc}")
+
+    async def set_extension_request(
+        self,
+        page_id: str,
+        requested_due: datetime,
+        reason: str,
+    ) -> None:
+        properties = {
+            TASK_PROP_EXTENSION_STATUS: {
+                "select": {"name": EXTENSION_STATUS_PENDING},
+            },
+            TASK_PROP_EXTENSION_DUE: {
+                "date": {"start": self._format_datetime(requested_due)},
+            },
+            TASK_PROP_EXTENSION_REASON: {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": reason[:2000]},
+                    }
+                ],
+            },
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to register extension request: {exc}")
+
+    async def approve_extension(
+        self,
+        page_id: str,
+        approved_due: datetime,
+    ) -> None:
+        properties = {
+            TASK_PROP_DUE: {
+                "date": {"start": self._format_datetime(approved_due)},
+            },
+            TASK_PROP_EXTENSION_STATUS: {
+                "select": {"name": EXTENSION_STATUS_APPROVED},
+            },
+            TASK_PROP_EXTENSION_DUE: {
+                "date": None,
+            },
+            TASK_PROP_EXTENSION_REASON: {
+                "rich_text": [],
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_NOT_SENT},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": False,
+            },
+            TASK_PROP_LAST_REMIND_AT: {
+                "date": None,
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": None,
+            },
+            TASK_PROP_OVERDUE_POINTS: {
+                "number": 0,
+            },
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_IN_PROGRESS},
+            },
+            TASK_PROP_COMPLETION_REQUESTED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_NOTE: {
+                "rich_text": [],
+            },
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to approve extension: {exc}")
+
+    async def reject_extension(self, page_id: str) -> None:
+        properties = {
+            TASK_PROP_EXTENSION_STATUS: {
+                "select": {"name": EXTENSION_STATUS_REJECTED},
+            },
+            TASK_PROP_EXTENSION_DUE: {
+                "date": None,
+            },
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to reject extension: {exc}")
+
+    async def set_overdue_points(self, page_id: str, points: int) -> None:
+        properties = {
+            TASK_PROP_OVERDUE_POINTS: {
+                "number": points,
+            }
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to update overdue points: {exc}")
+
+    async def request_completion(
+        self,
+        page_id: str,
+        request_time: datetime,
+        note: Optional[str],
+        requested_before_due: bool,
+    ) -> None:
+        properties = {
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_REQUESTED},
+            },
+            TASK_PROP_COMPLETION_REQUESTED_AT: {
+                "date": {"start": self._format_datetime(request_time)},
+            },
+            TASK_PROP_COMPLETION_APPROVED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_REJECT_REASON: {
+                "rich_text": [],
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_ACKED},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": True,
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": {"start": self._format_datetime(request_time)},
+            },
+        }
+
+        if note:
+            properties[TASK_PROP_COMPLETION_NOTE] = {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": note[:2000]},
+                    }
+                ]
+            }
+        else:
+            properties[TASK_PROP_COMPLETION_NOTE] = {"rich_text": []}
+
+        if requested_before_due:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
+        else:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to register completion request: {exc}")
+
+    async def approve_completion(
+        self,
+        page_id: str,
+        approval_time: datetime,
+        requested_before_due: bool,
+    ) -> None:
+        properties = {
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_APPROVED},
+            },
+            TASK_PROP_COMPLETION_APPROVED_AT: {
+                "date": {"start": self._format_datetime(approval_time)},
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_ACKED},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": True,
+            },
+        }
+
+        if requested_before_due:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
+        else:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to approve completion: {exc}")
+
+    async def reject_completion(
+        self,
+        page_id: str,
+        new_due: datetime,
+        reason: str,
+    ) -> None:
+        properties = {
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_REJECTED},
+            },
+            TASK_PROP_COMPLETION_REQUESTED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_APPROVED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_REJECT_REASON: {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": reason[:2000]},
+                    }
+                ],
+            },
+            TASK_PROP_COMPLETION_NOTE: {
+                "rich_text": [],
+            },
+            TASK_PROP_DUE: {
+                "date": {"start": self._format_datetime(new_due)},
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_NOT_SENT},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": False,
+            },
+            TASK_PROP_LAST_REMIND_AT: {
+                "date": None,
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": None,
+            },
+            TASK_PROP_OVERDUE_POINTS: {
+                "number": 0,
+            },
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to reject completion request: {exc}")
+
+
+    def _to_snapshot(self, page: Dict[str, Any]) -> NotionTaskSnapshot:
+        properties = page.get("properties", {})
+
+        title = ""
+        title_prop = properties.get(TASK_PROP_TITLE)
+        if title_prop and title_prop.get("title"):
+            title = title_prop["title"][0]["plain_text"]
+
+        due_prop = properties.get(TASK_PROP_DUE, {})
+        due_date = self._parse_datetime(due_prop.get("date"))
+
+        status_prop = properties.get(TASK_PROP_STATUS, {})
+        status_name = None
+        if status_prop.get("select"):
+            status_name = status_prop["select"].get("name")
+
+        requester_prop = properties.get(TASK_PROP_REQUESTER)
+        requester_id, requester_email = self._extract_people(requester_prop)
+
+        assignee_prop = properties.get(TASK_PROP_ASSIGNEE)
+        assignee_id, assignee_email = self._extract_people(assignee_prop)
+
+        reminder_stage_prop = properties.get(TASK_PROP_REMINDER_STAGE, {})
+        reminder_stage = None
+        if reminder_stage_prop.get("select"):
+            reminder_stage = reminder_stage_prop["select"].get("name")
+
+        last_remind_at_prop = properties.get(TASK_PROP_LAST_REMIND_AT, {})
+        last_remind_at = self._parse_datetime(last_remind_at_prop.get("date"))
+
+        reminder_read_prop = properties.get(TASK_PROP_REMINDER_READ, {})
+        reminder_read = bool(reminder_read_prop.get("checkbox", False))
+
+        last_read_at_prop = properties.get(TASK_PROP_LAST_READ_AT, {})
+        reminder_read_at = self._parse_datetime(last_read_at_prop.get("date"))
+
+        extension_status_prop = properties.get(TASK_PROP_EXTENSION_STATUS, {})
+        extension_status = None
+        if extension_status_prop.get("select"):
+            extension_status = extension_status_prop["select"].get("name")
+
+        extension_due_prop = properties.get(TASK_PROP_EXTENSION_DUE, {})
+        extension_requested_due = self._parse_datetime(extension_due_prop.get("date"))
+
+        extension_reason_prop = properties.get(TASK_PROP_EXTENSION_REASON)
+        extension_reason = self._extract_rich_text(extension_reason_prop)
+
+        overdue_points_prop = properties.get(TASK_PROP_OVERDUE_POINTS, {})
+        overdue_points = int(overdue_points_prop.get("number")) if overdue_points_prop.get("number") is not None else 0
+
+        completion_status_prop = properties.get(TASK_PROP_COMPLETION_STATUS, {})
+        completion_status = None
+        if completion_status_prop.get("select"):
+            completion_status = completion_status_prop["select"].get("name")
+
+        completion_requested_prop = properties.get(TASK_PROP_COMPLETION_REQUESTED_AT, {})
+        completion_requested_at = self._parse_datetime(completion_requested_prop.get("date"))
+
+        completion_note_prop = properties.get(TASK_PROP_COMPLETION_NOTE)
+        completion_note = self._extract_rich_text(completion_note_prop)
+
+        completion_approved_prop = properties.get(TASK_PROP_COMPLETION_APPROVED_AT, {})
+        completion_approved_at = self._parse_datetime(completion_approved_prop.get("date"))
+
+        completion_reject_reason_prop = properties.get(TASK_PROP_COMPLETION_REJECT_REASON)
+        completion_reject_reason = self._extract_rich_text(completion_reject_reason_prop)
+
+        return NotionTaskSnapshot(
+            page_id=page.get("id"),
+            title=title,
+            due_date=due_date,
+            status=status_name,
+            requester_email=requester_email,
+            requester_notion_id=requester_id,
+            assignee_email=assignee_email,
+            assignee_notion_id=assignee_id,
+            reminder_stage=reminder_stage,
+            reminder_last_sent_at=last_remind_at,
+            reminder_read=reminder_read,
+            reminder_read_at=reminder_read_at,
+            extension_status=extension_status,
+            extension_requested_due=extension_requested_due,
+            extension_reason=extension_reason,
+            overdue_points=overdue_points,
+            completion_status=completion_status,
+            completion_requested_at=completion_requested_at,
+            completion_note=completion_note,
+            completion_approved_at=completion_approved_at,
+            completion_reject_reason=completion_reject_reason,
+        )
+
     async def update_task_status(
         self,
         page_id: str,
@@ -568,3 +1298,4 @@ class DynamicNotionService:
         except Exception as e:
             print(f"Error updating Notion task: {e}")
             raise
+JST = ZoneInfo("Asia/Tokyo")

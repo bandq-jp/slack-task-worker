@@ -1,17 +1,55 @@
 import json
-from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from src.domain.entities.task import TaskRequest
 from src.utils.text_converter import convert_rich_text_to_plain_text
+from zoneinfo import ZoneInfo
+
+REMINDER_STAGE_LABELS = {
+    "期日前": "⏰ 期日前リマインド",
+    "当日": "📅 本日が納期です",
+    "超過": "⚠️ 納期超過",
+    "既読": "✅ 既読済み",
+    "未送信": "ℹ️ リマインド準備中",
+}
+
+JST = ZoneInfo("Asia/Tokyo")
 
 
 class SlackService:
     """Slack APIサービス"""
 
-    def __init__(self, slack_token: str, slack_bot_token: str):
+    def __init__(self, slack_token: str, slack_bot_token: str, env: str = "local"):
         self.client = WebClient(token=slack_bot_token)
         self.user_client = WebClient(token=slack_token)
+        self.env = env
+
+    @property
+    def app_name_suffix(self) -> str:
+        """環境に応じてアプリ名の接尾辞を返す"""
+        if self.env == "production":
+            return ""
+        else:
+            return " (Dev)"
+
+    def _format_datetime(self, value: datetime) -> str:
+        if not value:
+            return ""
+        value = self._ensure_jst(value)
+        return value.strftime("%Y-%m-%d %H:%M")
+
+    def _ensure_jst(self, value: Optional[datetime]) -> Optional[datetime]:
+        if not value:
+            return None
+        if value.tzinfo:
+            return value.astimezone(JST)
+        return value.replace(tzinfo=JST)
+
+    def _datetimepicker_initial(self, value: Optional[datetime]) -> int:
+        target = self._ensure_jst(value) or datetime.now(JST)
+        return int(target.astimezone(timezone.utc).timestamp())
 
     async def get_user_info(self, user_id: str) -> Dict[str, Any]:
         """ユーザー情報を取得"""
@@ -193,6 +231,660 @@ class SlackService:
         except SlackApiError as e:
             print(f"Error sending rejection notification: {e}")
 
+    async def send_task_reminder(
+        self,
+        assignee_slack_id: str,
+        snapshot,
+        stage: str,
+        requester_slack_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """タスクリマインド通知を送信"""
+        try:
+            dm_response = self.client.conversations_open(users=assignee_slack_id)
+            channel_id = dm_response["channel"]["id"]
+
+            stage_label = REMINDER_STAGE_LABELS.get(stage, stage or "リマインド")
+            due_text = self._format_datetime(snapshot.due_date) if getattr(snapshot, "due_date", None) else "未設定"
+            notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+            extension_status = getattr(snapshot, "extension_status", None)
+            overdue_points = getattr(snapshot, "overdue_points", 0)
+
+            info_lines = [f"*ステータス:* {getattr(snapshot, 'status', '未取得')}"]
+            if extension_status and extension_status != "なし":
+                info_lines.append(f"*延期ステータス:* {extension_status}")
+            if overdue_points:
+                info_lines.append(f"*納期超過ポイント:* {overdue_points}")
+
+            blocks: List[Dict[str, Any]] = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"{stage_label} - {snapshot.title}",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*件名:*\n<{notion_url}|{snapshot.title}>",
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*納期:*\n{due_text}",
+                        },
+                    ],
+                },
+            ]
+
+            if info_lines:
+                blocks.append(
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": "\n".join(info_lines)},
+                    }
+                )
+
+            blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "👀 既読", "emoji": True},
+                            "style": "primary",
+                            "action_id": "mark_reminder_read",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "stage": stage,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "⏳ 延期申請", "emoji": True},
+                            "action_id": "open_extension_modal",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "stage": stage,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ 完了", "emoji": True},
+                            "style": "primary",
+                            "action_id": "open_completion_modal",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "stage": stage,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                        },
+                    ],
+                }
+            )
+
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "既読でリマインドを終了できます。延期申請は依頼者承認後に反映されます。",
+                        }
+                    ],
+                }
+            )
+
+            return self.client.chat_postMessage(
+                channel=channel_id,
+                text=f"{stage_label}: {snapshot.title}",
+                blocks=blocks,
+            )
+
+        except SlackApiError as e:
+            print(f"Error sending task reminder: {e}")
+            raise
+
+    async def open_extension_modal(
+        self,
+        trigger_id: str,
+        snapshot,
+        stage: str,
+        requester_slack_id: str,
+        assignee_slack_id: str,
+    ):
+        """延期申請モーダルを表示"""
+        try:
+            due_text = self._format_datetime(snapshot.due_date) if getattr(snapshot, "due_date", None) else "未設定"
+            requested_metadata = {
+                "page_id": snapshot.page_id,
+                "stage": stage,
+                "requester_slack_id": requester_slack_id,
+                "assignee_slack_id": assignee_slack_id,
+            }
+
+            datetimepicker_element: Dict[str, Any] = {
+                "type": "datetimepicker",
+                "action_id": "new_due_picker",
+            }
+            if getattr(snapshot, "due_date", None):
+                datetimepicker_element["initial_date_time"] = self._datetimepicker_initial(snapshot.due_date)
+
+            modal = {
+                "type": "modal",
+                "callback_id": "extension_request_modal",
+                "title": {"type": "plain_text", "text": "延期申請"},
+                "submit": {"type": "plain_text", "text": "申請"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*{snapshot.title}*\n現在の納期: {due_text}\nステージ: {REMINDER_STAGE_LABELS.get(stage, stage)}"
+                        },
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "new_due_block",
+                        "element": datetimepicker_element,
+                        "label": {"type": "plain_text", "text": "新しい希望納期"},
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "reason_block",
+                        "label": {"type": "plain_text", "text": "延期理由"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reason_input",
+                            "multiline": True,
+                            "placeholder": {"type": "plain_text", "text": "延期が必要な理由を記入"},
+                        },
+                    },
+                ],
+                "private_metadata": json.dumps(requested_metadata),
+            }
+
+            return self.client.views_open(trigger_id=trigger_id, view=modal)
+
+        except SlackApiError as e:
+            print(f"Error opening extension request modal: {e}")
+            raise
+
+    async def send_extension_request_to_requester(
+        self,
+        requester_slack_id: str,
+        assignee_slack_id: str,
+        snapshot,
+        requested_due: datetime,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """依頼者へ延期承認リクエストを送信"""
+        try:
+            dm_response = self.client.conversations_open(users=requester_slack_id)
+            channel_id = dm_response["channel"]["id"]
+
+            due_text = self._format_datetime(snapshot.due_date) if getattr(snapshot, "due_date", None) else "未設定"
+            requested_due_text = self._format_datetime(requested_due)
+
+            blocks: List[Dict[str, Any]] = [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "⏳ 延期承認リクエスト", "emoji": True},
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*タスク:*\n{snapshot.title}"},
+                        {"type": "mrkdwn", "text": f"*申請者:*\n<@{assignee_slack_id}>"},
+                        {"type": "mrkdwn", "text": f"*現在の納期:*\n{due_text}"},
+                        {"type": "mrkdwn", "text": f"*新しい期日案:*\n{requested_due_text}"},
+                    ],
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*理由:*\n{reason}"},
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "text": {"type": "plain_text", "text": "承認", "emoji": True},
+                            "action_id": "approve_extension_request",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "assignee_slack_id": assignee_slack_id,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                        },
+                        {
+                            "type": "button",
+                            "style": "danger",
+                            "text": {"type": "plain_text", "text": "却下", "emoji": True},
+                            "action_id": "reject_extension_request",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "assignee_slack_id": assignee_slack_id,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                        },
+                    ],
+                },
+            ]
+
+            return self.client.chat_postMessage(
+                channel=channel_id,
+                text=f"延期承認リクエスト: {snapshot.title}",
+                blocks=blocks,
+            )
+
+        except SlackApiError as e:
+            print(f"Error sending extension approval request: {e}")
+            raise
+
+    async def notify_extension_request_submitted(
+        self,
+        assignee_slack_id: str,
+        requested_due: datetime,
+    ) -> None:
+        try:
+            dm_response = self.client.conversations_open(users=assignee_slack_id)
+            channel_id = dm_response["channel"]["id"]
+
+            self.client.chat_postMessage(
+                channel=channel_id,
+                text="延期申請を送信しました。依頼者の承認をお待ちください。",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"⏳ 延期申請を送信しました。\n希望納期: {self._format_datetime(requested_due)}",
+                        },
+                    }
+                ],
+            )
+        except SlackApiError as e:
+            print(f"Error notifying submitter about extension request: {e}")
+
+    async def notify_extension_approved(
+        self,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+        snapshot,
+        new_due: datetime,
+    ) -> None:
+        message = f"✅ 延期が承認されました。新しい納期: {self._format_datetime(new_due)}"
+        try:
+            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            self.client.chat_postMessage(
+                channel=assignee_dm["channel"]["id"],
+                text=message,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"✅ *延期承認*\nタスク: {snapshot.title}\n新しい納期: {self._format_datetime(new_due)}",
+                        },
+                    }
+                ],
+            )
+
+            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            self.client.chat_postMessage(
+                channel=requester_dm["channel"]["id"],
+                text=message,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"✅ 延期申請を承認しました。\nタスク: {snapshot.title}\n新しい納期: {self._format_datetime(new_due)}",
+                        },
+                    }
+                ],
+            )
+        except SlackApiError as e:
+            print(f"Error notifying extension approval: {e}")
+
+    async def notify_extension_rejected(
+        self,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+        snapshot,
+        reason: Optional[str] = None,
+    ) -> None:
+        rejection_text = "延期申請は却下されました。"
+        detail = reason or "理由は依頼者に確認してください。"
+        try:
+            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            self.client.chat_postMessage(
+                channel=assignee_dm["channel"]["id"],
+                text=rejection_text,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"⚠️ *延期却下*\nタスク: {snapshot.title}\n理由: {detail}",
+                        },
+                    }
+                ],
+            )
+
+            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            self.client.chat_postMessage(
+                channel=requester_dm["channel"]["id"],
+                text=rejection_text,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"⚠️ 延期申請を却下しました。必要であればメンションで共有してください。",
+                        },
+                    }
+                ],
+            )
+        except SlackApiError as e:
+            print(f"Error notifying extension rejection: {e}")
+
+    async def open_completion_modal(
+        self,
+        trigger_id: str,
+        snapshot,
+        stage: str,
+        requester_slack_id: str,
+        assignee_slack_id: str,
+    ):
+        """完了報告モーダル"""
+        try:
+            notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+            now_jst = self._ensure_jst(datetime.now(JST))
+            due_jst = self._ensure_jst(snapshot.due_date) if getattr(snapshot, "due_date", None) else None
+            overdue = bool(due_jst and now_jst > due_jst)
+
+            note_label = "遅延理由（必須）" if overdue else "完了メモ（任意）"
+            note_placeholder = "遅延となった理由を記入してください" if overdue else "完了内容や共有事項を記入"
+
+            modal = {
+                "type": "modal",
+                "callback_id": "completion_request_modal",
+                "title": {"type": "plain_text", "text": "完了報告"},
+                "submit": {"type": "plain_text", "text": "送信"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"*{snapshot.title}*\n納期: {self._format_datetime(snapshot.due_date)}\n"
+                                f"状況: {REMINDER_STAGE_LABELS.get(stage, stage)}\n"
+                                f"完了日時は送信時刻（JST）に自動記録されます。\n"
+                                f"Notion: <{notion_url}|ページを開く>"
+                            ),
+                        },
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "note_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "note_input",
+                            "multiline": True,
+                            "placeholder": {"type": "plain_text", "text": note_placeholder},
+                        },
+                        "label": {"type": "plain_text", "text": note_label},
+                        "optional": not overdue,
+                    },
+                ],
+                "private_metadata": json.dumps({
+                    "page_id": snapshot.page_id,
+                    "requester_slack_id": requester_slack_id,
+                    "assignee_slack_id": assignee_slack_id,
+                    "require_reason": overdue,
+                }),
+            }
+
+            return self.client.views_open(trigger_id=trigger_id, view=modal)
+        except SlackApiError as e:
+            print(f"Error opening completion modal: {e}")
+            raise
+
+    async def send_completion_request_to_requester(
+        self,
+        requester_slack_id: str,
+        assignee_slack_id: str,
+        snapshot,
+        completion_note: Optional[str],
+        requested_at: datetime,
+        overdue: bool,
+    ) -> Dict[str, Any]:
+        try:
+            dm_response = self.client.conversations_open(users=requester_slack_id)
+            channel_id = dm_response["channel"]["id"]
+
+            notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+            fields = [
+                {"type": "mrkdwn", "text": f"*タスク:*\n<{notion_url}|{snapshot.title}>"},
+                {"type": "mrkdwn", "text": f"*申請者:*\n<@{assignee_slack_id}>"},
+                {"type": "mrkdwn", "text": f"*現在の納期:*\n{self._format_datetime(snapshot.due_date)}"},
+                {"type": "mrkdwn", "text": f"*申請日時:*\n{self._format_datetime(requested_at)}"},
+            ]
+
+            blocks: List[Dict[str, Any]] = [
+                {"type": "header", "text": {"type": "plain_text", "text": "✅ 完了承認リクエスト", "emoji": True}},
+                {"type": "section", "fields": fields},
+            ]
+
+            if completion_note:
+                label = "遅延理由" if overdue else "完了メモ"
+                blocks.append(
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*{label}:*\n{completion_note}"},
+                    }
+                )
+
+            blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "text": {"type": "plain_text", "text": "承認", "emoji": True},
+                            "action_id": "approve_completion_request",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "assignee_slack_id": assignee_slack_id,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                        },
+                        {
+                            "type": "button",
+                            "style": "danger",
+                            "text": {"type": "plain_text", "text": "却下", "emoji": True},
+                            "action_id": "reject_completion_request",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "assignee_slack_id": assignee_slack_id,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                        },
+                    ],
+                }
+            )
+
+            return self.client.chat_postMessage(
+                channel=channel_id,
+                text=f"完了承認リクエスト: {snapshot.title}",
+                blocks=blocks,
+            )
+        except SlackApiError as e:
+            print(f"Error sending completion approval request: {e}")
+            raise
+
+    async def notify_completion_request_submitted(
+        self,
+        assignee_slack_id: str,
+    ) -> None:
+        try:
+            dm = self.client.conversations_open(users=assignee_slack_id)
+            self.client.chat_postMessage(
+                channel=dm["channel"]["id"],
+                text="完了承認を依頼者に送信しました。承認をお待ちください。",
+            )
+        except SlackApiError as e:
+            print(f"Error notifying submitter of completion request: {e}")
+
+    async def notify_completion_approved(
+        self,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+        snapshot,
+        approval_time: datetime,
+    ) -> None:
+        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+        message = f"✅ 完了が承認されました ({self._format_datetime(approval_time)})"
+        try:
+            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            self.client.chat_postMessage(
+                channel=assignee_dm["channel"]["id"],
+                text=message,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"✅ *完了承認*\nタスク: <{notion_url}|{snapshot.title}>\n承認日時: {self._format_datetime(approval_time)}",
+                        },
+                    }
+                ],
+            )
+
+            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            self.client.chat_postMessage(
+                channel=requester_dm["channel"]["id"],
+                text=message,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"✅ 完了を承認しました。\nタスク: <{notion_url}|{snapshot.title}>\n承認日時: {self._format_datetime(approval_time)}",
+                        },
+                    }
+                ],
+            )
+        except SlackApiError as e:
+            print(f"Error notifying completion approval: {e}")
+
+    async def notify_completion_rejected(
+        self,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+        snapshot,
+        reason: str,
+        new_due: datetime,
+    ) -> None:
+        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+        try:
+            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            self.client.chat_postMessage(
+                channel=assignee_dm["channel"]["id"],
+                text="⚠️ 完了申請が却下されました。",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"⚠️ *完了却下*\nタスク: <{notion_url}|{snapshot.title}>\n新しい納期: {self._format_datetime(new_due)}\n理由: {reason}",
+                        },
+                    }
+                ],
+            )
+
+            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            self.client.chat_postMessage(
+                channel=requester_dm["channel"]["id"],
+                text="⚠️ 完了申請を却下しました。",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"⚠️ 完了申請を却下しました。\nタスク: <{notion_url}|{snapshot.title}>\n新しい納期: {self._format_datetime(new_due)}\n理由: {reason}",
+                        },
+                    }
+                ],
+            )
+        except SlackApiError as e:
+            print(f"Error notifying completion rejection: {e}")
+
+    async def open_completion_reject_modal(
+        self,
+        trigger_id: str,
+        snapshot,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+    ):
+        try:
+            modal = {
+                "type": "modal",
+                "callback_id": "completion_reject_modal",
+                "title": {"type": "plain_text", "text": "完了却下"},
+                "submit": {"type": "plain_text", "text": "送信"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"完了申請を却下します。新しい納期と理由を入力してください。\nタスク: {snapshot.title}"
+                        },
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "new_due_block",
+                        "label": {"type": "plain_text", "text": "新しい納期"},
+                        "element": {
+                            "type": "datetimepicker",
+                            "action_id": "new_due_picker",
+                            "initial_date_time": self._datetimepicker_initial(snapshot.due_date or datetime.now(JST)),
+                        },
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "reason_block",
+                        "label": {"type": "plain_text", "text": "却下理由"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reason_input",
+                            "multiline": True,
+                            "placeholder": {"type": "plain_text", "text": "理由を入力"},
+                        },
+                    },
+                ],
+                "private_metadata": json.dumps({
+                    "page_id": snapshot.page_id,
+                    "assignee_slack_id": assignee_slack_id,
+                    "requester_slack_id": requester_slack_id,
+                }),
+            }
+            return self.client.views_open(trigger_id=trigger_id, view=modal)
+        except SlackApiError as e:
+            print(f"Error opening completion reject modal: {e}")
+            raise
+
     async def open_task_modal(self, trigger_id: str, user_id: str):
         """タスク作成モーダルを開く"""
         try:
@@ -200,7 +892,7 @@ class SlackService:
             loading_modal = {
                 "type": "modal",
                 "callback_id": "create_task_modal_loading",
-                "title": {"type": "plain_text", "text": "タスク依頼作成"},
+                "title": {"type": "plain_text", "text": f"タスク依頼作成{self.app_name_suffix}"},
                 "close": {"type": "plain_text", "text": "キャンセル"},
                 "blocks": [
                     {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ 初期化中…"}}
@@ -243,7 +935,7 @@ class SlackService:
             full_modal = {
                 "type": "modal",
                 "callback_id": "create_task_modal",
-                "title": {"type": "plain_text", "text": "タスク依頼作成"},
+                "title": {"type": "plain_text", "text": f"タスク依頼作成{self.app_name_suffix}"},
                 "submit": {"type": "plain_text", "text": "作成"},
                 "close": {"type": "plain_text", "text": "キャンセル"},
                 "blocks": [

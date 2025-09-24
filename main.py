@@ -1,13 +1,22 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import os
+from dotenv import load_dotenv
 from src.presentation.api.slack_endpoints import router as slack_router
+
+# 環境変数をロード
+load_dotenv()
 
 
 def create_app() -> FastAPI:
     """アプリケーションファクトリー"""
+    # 環境に応じてアプリタイトルを変更
+    env = os.getenv("ENV", "local")
+    app_suffix = " (Dev)" if env != "production" else ""
+
     app = FastAPI(
-        title="Slack-Notion Task Management System",
+        title=f"Slack-Notion Task Management System{app_suffix}",
         description="Slack経由でタスク依頼を作成し、Notionに保存するシステム",
         version="1.0.0",
     )
@@ -26,7 +35,11 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     async def root():
-        return {"message": "Slack-Notion Task Management System is running"}
+        return {
+            "message": f"Slack-Notion Task Management System{app_suffix} is running",
+            "environment": env,
+            "version": "1.0.0"
+        }
 
     @app.get("/health")
     async def health_check():
