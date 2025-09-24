@@ -2,6 +2,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Union
 from notion_client import Client
 from src.domain.entities.task import TaskRequest
@@ -21,6 +22,11 @@ EXTENSION_STATUS_PENDING = "申請中"
 EXTENSION_STATUS_APPROVED = "承認済"
 EXTENSION_STATUS_REJECTED = "却下"
 
+COMPLETION_STATUS_IN_PROGRESS = "進行中"
+COMPLETION_STATUS_REQUESTED = "完了申請中"
+COMPLETION_STATUS_APPROVED = "完了承認"
+COMPLETION_STATUS_REJECTED = "完了却下"
+
 EXCLUDED_STATUSES_FOR_REMINDER = {"差し戻し", "完了", "無効"}
 
 TASK_PROP_TITLE = "タイトル"
@@ -36,6 +42,12 @@ TASK_PROP_EXTENSION_STATUS = "延期ステータス"
 TASK_PROP_EXTENSION_DUE = "延期期日（申請中）"
 TASK_PROP_EXTENSION_REASON = "延期理由（申請中）"
 TASK_PROP_OVERDUE_POINTS = "納期超過ポイント"
+
+TASK_PROP_COMPLETION_STATUS = "完了ステータス"
+TASK_PROP_COMPLETION_REQUESTED_AT = "完了申請日時"
+TASK_PROP_COMPLETION_APPROVED_AT = "完了承認日時"
+TASK_PROP_COMPLETION_NOTE = "完了報告メモ"
+TASK_PROP_COMPLETION_REJECT_REASON = "完了却下理由"
 
 AUDIT_PROP_TITLE = "イベント"
 AUDIT_PROP_EVENT_TYPE = "種別"
@@ -63,6 +75,11 @@ class NotionTaskSnapshot:
     extension_requested_due: Optional[datetime]
     extension_reason: Optional[str]
     overdue_points: int
+    completion_status: Optional[str]
+    completion_requested_at: Optional[datetime]
+    completion_note: Optional[str]
+    completion_approved_at: Optional[datetime]
+    completion_reject_reason: Optional[str]
 
 
 class DynamicNotionService:
@@ -455,6 +472,12 @@ class DynamicNotionService:
                 TASK_PROP_EXTENSION_STATUS: {
                     "select": {"name": EXTENSION_STATUS_NONE},
                 },
+                TASK_PROP_COMPLETION_STATUS: {
+                    "select": {"name": COMPLETION_STATUS_IN_PROGRESS},
+                },
+                TASK_PROP_COMPLETION_NOTE: {
+                    "rich_text": [],
+                },
             }
 
             # 依頼者プロパティ（Peopleタイプ）
@@ -809,7 +832,7 @@ class DynamicNotionService:
                 "title": [
                     {
                         "text": {
-                            "content": f"{event_type} - {datetime.now().strftime('%Y/%m/%d %H:%M')}"
+                            "content": f"{event_type} - {datetime.now(JST).strftime('%Y/%m/%d %H:%M')}"
                         }
                     }
                 ]
@@ -830,7 +853,7 @@ class DynamicNotionService:
             },
             AUDIT_PROP_OCCURRED_AT: {
                 "date": {
-                    "start": self._format_datetime(datetime.now(timezone.utc))
+                    "start": self._format_datetime(datetime.now(JST))
                 }
             },
         }
@@ -968,6 +991,15 @@ class DynamicNotionService:
             TASK_PROP_OVERDUE_POINTS: {
                 "number": 0,
             },
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_IN_PROGRESS},
+            },
+            TASK_PROP_COMPLETION_REQUESTED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_NOTE: {
+                "rich_text": [],
+            },
         }
 
         try:
@@ -1001,6 +1033,142 @@ class DynamicNotionService:
             self.client.pages.update(page_id=page_id, properties=properties)
         except Exception as exc:
             print(f"⚠️ Failed to update overdue points: {exc}")
+
+    async def request_completion(
+        self,
+        page_id: str,
+        request_time: datetime,
+        note: Optional[str],
+        requested_before_due: bool,
+    ) -> None:
+        properties = {
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_REQUESTED},
+            },
+            TASK_PROP_COMPLETION_REQUESTED_AT: {
+                "date": {"start": self._format_datetime(request_time)},
+            },
+            TASK_PROP_COMPLETION_APPROVED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_REJECT_REASON: {
+                "rich_text": [],
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_ACKED},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": True,
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": {"start": self._format_datetime(request_time)},
+            },
+        }
+
+        if note:
+            properties[TASK_PROP_COMPLETION_NOTE] = {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": note[:2000]},
+                    }
+                ]
+            }
+        else:
+            properties[TASK_PROP_COMPLETION_NOTE] = {"rich_text": []}
+
+        if requested_before_due:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
+        else:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to register completion request: {exc}")
+
+    async def approve_completion(
+        self,
+        page_id: str,
+        approval_time: datetime,
+        requested_before_due: bool,
+    ) -> None:
+        properties = {
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_APPROVED},
+            },
+            TASK_PROP_COMPLETION_APPROVED_AT: {
+                "date": {"start": self._format_datetime(approval_time)},
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_ACKED},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": True,
+            },
+        }
+
+        if requested_before_due:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
+        else:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to approve completion: {exc}")
+
+    async def reject_completion(
+        self,
+        page_id: str,
+        new_due: datetime,
+        reason: str,
+    ) -> None:
+        properties = {
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_REJECTED},
+            },
+            TASK_PROP_COMPLETION_REQUESTED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_APPROVED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_REJECT_REASON: {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": reason[:2000]},
+                    }
+                ],
+            },
+            TASK_PROP_COMPLETION_NOTE: {
+                "rich_text": [],
+            },
+            TASK_PROP_DUE: {
+                "date": {"start": self._format_datetime(new_due)},
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_NOT_SENT},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": False,
+            },
+            TASK_PROP_LAST_REMIND_AT: {
+                "date": None,
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": None,
+            },
+            TASK_PROP_OVERDUE_POINTS: {
+                "number": 0,
+            },
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to reject completion request: {exc}")
 
 
     def _to_snapshot(self, page: Dict[str, Any]) -> NotionTaskSnapshot:
@@ -1053,6 +1221,23 @@ class DynamicNotionService:
         overdue_points_prop = properties.get(TASK_PROP_OVERDUE_POINTS, {})
         overdue_points = int(overdue_points_prop.get("number")) if overdue_points_prop.get("number") is not None else 0
 
+        completion_status_prop = properties.get(TASK_PROP_COMPLETION_STATUS, {})
+        completion_status = None
+        if completion_status_prop.get("select"):
+            completion_status = completion_status_prop["select"].get("name")
+
+        completion_requested_prop = properties.get(TASK_PROP_COMPLETION_REQUESTED_AT, {})
+        completion_requested_at = self._parse_datetime(completion_requested_prop.get("date"))
+
+        completion_note_prop = properties.get(TASK_PROP_COMPLETION_NOTE)
+        completion_note = self._extract_rich_text(completion_note_prop)
+
+        completion_approved_prop = properties.get(TASK_PROP_COMPLETION_APPROVED_AT, {})
+        completion_approved_at = self._parse_datetime(completion_approved_prop.get("date"))
+
+        completion_reject_reason_prop = properties.get(TASK_PROP_COMPLETION_REJECT_REASON)
+        completion_reject_reason = self._extract_rich_text(completion_reject_reason_prop)
+
         return NotionTaskSnapshot(
             page_id=page.get("id"),
             title=title,
@@ -1070,6 +1255,11 @@ class DynamicNotionService:
             extension_requested_due=extension_requested_due,
             extension_reason=extension_reason,
             overdue_points=overdue_points,
+            completion_status=completion_status,
+            completion_requested_at=completion_requested_at,
+            completion_note=completion_note,
+            completion_approved_at=completion_approved_at,
+            completion_reject_reason=completion_reject_reason,
         )
 
     async def update_task_status(
@@ -1108,3 +1298,4 @@ class DynamicNotionService:
         except Exception as e:
             print(f"Error updating Notion task: {e}")
             raise
+JST = ZoneInfo("Asia/Tokyo")

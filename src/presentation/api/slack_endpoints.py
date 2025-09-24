@@ -13,6 +13,8 @@ from src.infrastructure.notion.dynamic_notion_service import (
     REMINDER_STAGE_OVERDUE,
     EXTENSION_STATUS_APPROVED,
     EXTENSION_STATUS_PENDING,
+    COMPLETION_STATUS_REQUESTED,
+    COMPLETION_STATUS_APPROVED,
 )
 from src.infrastructure.repositories.notion_user_repository_impl import NotionUserRepositoryImpl
 from src.infrastructure.repositories.slack_user_repository_impl import SlackUserRepositoryImpl
@@ -26,6 +28,7 @@ from src.application.services.calendar_task_service import CalendarTaskApplicati
 from src.services.ai_service import TaskAIService, TaskInfo, AIAnalysisResult
 from src.utils.text_converter import convert_rich_text_to_plain_text
 from src.domain.value_objects.email import Email
+from zoneinfo import ZoneInfo
 from pydantic_settings import BaseSettings
 
 
@@ -68,6 +71,7 @@ class Settings(BaseSettings):
 
 router = APIRouter(prefix="/slack", tags=["slack"])
 settings = Settings()
+JST = ZoneInfo("Asia/Tokyo")
 
 # セッション情報を一時的に保存する辞書
 modal_sessions = {}
@@ -172,6 +176,8 @@ async def run_reminders():
         return None
 
     def determine_stage(snapshot) -> Optional[str]:
+        if snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
+            return None
         due = snapshot.due_date
         if not due:
             return None
@@ -199,8 +205,12 @@ async def run_reminders():
             stage = determine_stage(snapshot)
 
             if stage is None:
-                if snapshot.overdue_points:
+                if snapshot.overdue_points and snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
                     await notion_service.set_overdue_points(snapshot.page_id, 0)
+                    snapshot.overdue_points = 0
+                elif snapshot.overdue_points and snapshot.completion_status != COMPLETION_STATUS_APPROVED:
+                    # leave as-is to reflect outstanding overdue
+                    pass
                 continue
 
             if stage == snapshot.reminder_stage:
@@ -214,7 +224,15 @@ async def run_reminders():
             requester_slack_id = await resolve_slack_id(snapshot.requester_email)
 
             if stage == REMINDER_STAGE_OVERDUE:
-                target_points = 0 if snapshot.extension_status == EXTENSION_STATUS_APPROVED else 1
+                requested_before_due = _requested_on_time(
+                    snapshot.completion_requested_at,
+                    snapshot.due_date,
+                )
+                completion_safe = (
+                    snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}
+                    and requested_before_due
+                )
+                target_points = 0 if (snapshot.extension_status == EXTENSION_STATUS_APPROVED or completion_safe) else 1
                 if snapshot.overdue_points != target_points:
                     await notion_service.set_overdue_points(snapshot.page_id, target_points)
                     snapshot.overdue_points = target_points
@@ -488,7 +506,7 @@ async def handle_interactive(request: Request):
                         print(f"⚠️ Failed to notify user about missing page_id: {dm_error}")
                     return
 
-                read_time = datetime.now(timezone.utc)
+                read_time = datetime.now(JST)
                 try:
                     await notion_service.mark_reminder_read(page_id, read_time, stage)
                     snapshot = await notion_service.get_task_snapshot(page_id)
@@ -505,8 +523,8 @@ async def handle_interactive(request: Request):
 
                     if channel_id and message_ts and message_blocks:
                         try:
-                            updated_text = f"✅ <@{user_id}> が{stage_label}を既読 ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
-                            updated_blocks = _replace_actions_with_context(message_blocks, updated_text)
+                            updated_text = f"✅ <@{user_id}> が{stage_label}を既読 ({_format_datetime_text(datetime.now(JST))})"
+                            updated_blocks = _mark_read_update_blocks(message_blocks, updated_text)
                             slack_service.client.chat_update(
                                 channel=channel_id,
                                 ts=message_ts,
@@ -573,6 +591,159 @@ async def handle_interactive(request: Request):
             )
             return JSONResponse(content={})
 
+        elif action_id == "open_completion_modal":
+            try:
+                value_data = json.loads(action.get("value", "{}"))
+            except json.JSONDecodeError:
+                print("⚠️ Invalid payload for open_completion_modal")
+                return JSONResponse(content={})
+
+            page_id = value_data.get("page_id")
+            stage = value_data.get("stage")
+            requester_slack_id = value_data.get("requester_slack_id")
+
+            snapshot = await notion_service.get_task_snapshot(page_id)
+            if not snapshot:
+                try:
+                    dm = slack_service.client.conversations_open(users=user_id)
+                    slack_service.client.chat_postMessage(
+                        channel=dm["channel"]["id"],
+                        text="Notionのタスク情報を取得できませんでした。しばらくして再試行してください。",
+                    )
+                except Exception as dm_error:
+                    print(f"⚠️ Failed to notify user about missing snapshot: {dm_error}")
+                return JSONResponse(content={})
+
+            if not requester_slack_id and snapshot.requester_email:
+                try:
+                    requester_user = await slack_user_repository.find_by_email(Email(snapshot.requester_email))
+                    if requester_user:
+                        requester_slack_id = str(requester_user.user_id)
+                except Exception as lookup_error:
+                    print(f"⚠️ Failed to lookup requester Slack ID for completion modal: {lookup_error}")
+
+            if not requester_slack_id:
+                try:
+                    dm = slack_service.client.conversations_open(users=user_id)
+                    slack_service.client.chat_postMessage(
+                        channel=dm["channel"]["id"],
+                        text="依頼者のSlackアカウントが見つかりません。管理者にお問い合わせください。",
+                    )
+                except Exception as dm_error:
+                    print(f"⚠️ Failed to notify user about missing requester Slack ID: {dm_error}")
+                return JSONResponse(content={})
+
+            await slack_service.open_completion_modal(
+                trigger_id=trigger_id,
+                snapshot=snapshot,
+                stage=stage,
+                requester_slack_id=requester_slack_id,
+                assignee_slack_id=user_id,
+            )
+            return JSONResponse(content={})
+
+        elif action_id == "approve_completion_request":
+            try:
+                value_data = json.loads(action.get("value", "{}"))
+            except json.JSONDecodeError:
+                print("⚠️ Invalid payload for approve_completion_request")
+                return JSONResponse(content={})
+
+            page_id = value_data.get("page_id")
+            assignee_slack_id = value_data.get("assignee_slack_id")
+            requester_slack_id = value_data.get("requester_slack_id", user_id)
+            channel_id = payload.get("channel", {}).get("id")
+            message = payload.get("message", {})
+            message_ts = message.get("ts")
+            message_blocks = message.get("blocks", [])
+
+            import asyncio
+
+            async def run_completion_approval():
+                if not page_id:
+                    return
+                try:
+                    snapshot = await notion_service.get_task_snapshot(page_id)
+                    if not snapshot:
+                        slack_service.client.chat_postMessage(
+                            channel=slack_service.client.conversations_open(users=user_id)["channel"]["id"],
+                            text="Notionのタスク情報を取得できず承認できませんでした。",
+                        )
+                        return
+
+                    approval_time = datetime.now(JST)
+                    requested_before_due = _requested_on_time(
+                        snapshot.completion_requested_at if snapshot else None,
+                        snapshot.due_date if snapshot else None,
+                    )
+
+                    await notion_service.approve_completion(page_id, approval_time, requested_before_due)
+                    await notion_service.update_task_status(page_id, "completed")
+
+                    user_info = await slack_service.get_user_info(user_id)
+                    actor_email = user_info.get("profile", {}).get("email") if user_info else None
+                    await notion_service.record_audit_log(
+                        task_page_id=page_id,
+                        event_type="完了承認",
+                        detail=f"完了承認 {approval_time.astimezone().strftime('%Y-%m-%d %H:%M')}",
+                        actor_email=actor_email,
+                    )
+
+                    if channel_id and message_ts and message_blocks:
+                        try:
+                            updated_blocks = _replace_actions_with_context(
+                                message_blocks,
+                                f"✅ 完了を承認しました ({_format_datetime_text(datetime.now(JST))})",
+                            )
+                            slack_service.client.chat_update(
+                                channel=channel_id,
+                                ts=message_ts,
+                                blocks=updated_blocks,
+                                text="完了を承認しました",
+                            )
+                        except Exception as update_error:
+                            print(f"⚠️ Failed to update completion approval message: {update_error}")
+
+                    await slack_service.notify_completion_approved(
+                        assignee_slack_id=assignee_slack_id,
+                        requester_slack_id=requester_slack_id,
+                        snapshot=snapshot,
+                        approval_time=approval_time,
+                    )
+
+                except Exception as approval_error:
+                    print(f"⚠️ Completion approval failed: {approval_error}")
+
+            asyncio.create_task(run_completion_approval())
+            return JSONResponse(content={})
+
+        elif action_id == "reject_completion_request":
+            try:
+                value_data = json.loads(action.get("value", "{}"))
+            except json.JSONDecodeError:
+                print("⚠️ Invalid payload for reject_completion_request")
+                return JSONResponse(content={})
+
+            page_id = value_data.get("page_id")
+            assignee_slack_id = value_data.get("assignee_slack_id")
+            requester_slack_id = value_data.get("requester_slack_id", user_id)
+
+            snapshot = await notion_service.get_task_snapshot(page_id)
+            if not snapshot:
+                slack_service.client.chat_postMessage(
+                    channel=slack_service.client.conversations_open(users=user_id)["channel"]["id"],
+                    text="Notionのタスク情報を取得できませんでした。",
+                )
+                return JSONResponse(content={})
+
+            await slack_service.open_completion_reject_modal(
+                trigger_id=trigger_id,
+                snapshot=snapshot,
+                assignee_slack_id=assignee_slack_id,
+                requester_slack_id=requester_slack_id,
+            )
+            return JSONResponse(content={})
+
         elif action_id == "approve_extension_request":
             try:
                 value_data = json.loads(action.get("value", "{}"))
@@ -623,7 +794,7 @@ async def handle_interactive(request: Request):
 
                     updated_blocks = _replace_actions_with_context(
                         message_blocks,
-                        f"✅ 延期を承認しました ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                        f"✅ 延期を承認しました ({_format_datetime_text(datetime.now(JST))})",
                     ) if message_blocks else None
 
                     if channel_id and message_ts and updated_blocks:
@@ -686,7 +857,7 @@ async def handle_interactive(request: Request):
                         try:
                             updated_blocks = _replace_actions_with_context(
                                 message_blocks,
-                                f"⚠️ 延期申請を却下しました ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                                f"⚠️ 延期申請を却下しました ({_format_datetime_text(datetime.now(JST))})",
                             )
                             slack_service.client.chat_update(
                                 channel=channel_id,
@@ -758,7 +929,7 @@ async def handle_interactive(request: Request):
 
                 # 納期をdatetimeに変換
                 due_date_unix = values["due_date_block"]["due_date_picker"]["selected_date_time"]
-                due_date = datetime.fromtimestamp(due_date_unix)
+                due_date = datetime.fromtimestamp(due_date_unix, tz=timezone.utc).astimezone(JST)
 
                 dto = CreateTaskRequestDto(
                     requester_slack_id=private_metadata["requester_id"],
@@ -1025,7 +1196,7 @@ async def handle_interactive(request: Request):
                     }
                 )
 
-            requested_due = datetime.fromtimestamp(selected_ts, tz=timezone.utc)
+            requested_due = datetime.fromtimestamp(selected_ts, tz=timezone.utc).astimezone(JST)
             page_id = private_metadata.get("page_id")
             stage = private_metadata.get("stage")
             requester_slack_id = private_metadata.get("requester_slack_id")
@@ -1083,7 +1254,191 @@ async def handle_interactive(request: Request):
                 )
 
             return JSONResponse(content={})
-        
+
+        elif callback_id == "completion_request_modal":
+            values = view["state"]["values"]
+            private_metadata = json.loads(view.get("private_metadata", "{}"))
+            require_reason = private_metadata.get("require_reason", False)
+
+            note = values.get("note_block", {}).get("note_input", {}).get("value", "").strip()
+
+            if require_reason and not note:
+                return JSONResponse(
+                    content={
+                        "response_action": "errors",
+                        "errors": {"note_block": "遅延理由を入力してください"},
+                    }
+                )
+
+            page_id = private_metadata.get("page_id")
+            requester_slack_id = private_metadata.get("requester_slack_id")
+            assignee_slack_id = private_metadata.get("assignee_slack_id")
+            view_id = view.get("id")
+
+            loading_view = {
+                "type": "modal",
+                "callback_id": "completion_request_loading",
+                "title": {"type": "plain_text", "text": "完了申請"},
+                "close": {"type": "plain_text", "text": "閉じる"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "⏳ *完了申請を送信しています...*\n数秒お待ちください。"
+                        }
+                    }
+                ]
+            }
+
+            import asyncio
+
+            async def run_completion_request():
+                requested_at = datetime.now(JST)
+                try:
+                    snapshot = await notion_service.get_task_snapshot(page_id)
+                    if not snapshot:
+                        raise ValueError("Notionタスクが取得できませんでした")
+
+                    resolved_requester = requester_slack_id
+                    if not resolved_requester and snapshot.requester_email:
+                        requester_user = await slack_user_repository.find_by_email(Email(snapshot.requester_email))
+                        if requester_user:
+                            resolved_requester = str(requester_user.user_id)
+
+                    if not resolved_requester:
+                        raise ValueError("依頼者のSlackアカウントが見つかりません")
+
+                    requested_before_due = _requested_on_time(requested_at, snapshot.due_date)
+
+                    await notion_service.request_completion(
+                        page_id=page_id,
+                        request_time=requested_at,
+                        note=note,
+                        requested_before_due=requested_before_due,
+                    )
+
+                    await notion_service.record_audit_log(
+                        task_page_id=page_id,
+                        event_type="完了申請",
+                        detail=f"完了日時: {_format_datetime_text(requested_at)}\nメモ: {note or '（なし）'}",
+                        actor_email=snapshot.assignee_email,
+                    )
+
+                    await slack_service.send_completion_request_to_requester(
+                        requester_slack_id=resolved_requester,
+                        assignee_slack_id=assignee_slack_id,
+                        snapshot=snapshot,
+                        completion_note=note,
+                        requested_at=requested_at,
+                        overdue=not requested_before_due,
+                    )
+
+                    if assignee_slack_id:
+                        await slack_service.notify_completion_request_submitted(assignee_slack_id)
+
+                    if view_id:
+                        try:
+                            success_view = {
+                                "type": "modal",
+                                "callback_id": "completion_request_success",
+                                "title": {"type": "plain_text", "text": "完了申請"},
+                                "close": {"type": "plain_text", "text": "閉じる"},
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": f"✅ *完了申請を送信しました*\n承認結果は依頼者からの通知をお待ちください。"
+                                        }
+                                    }
+                                ]
+                            }
+                            slack_service.client.views_update(view_id=view_id, view=success_view)
+                        except Exception as update_error:
+                            print(f"⚠️ 完了申請成功ビューの表示に失敗: {update_error}")
+
+                except Exception as req_error:
+                    print(f"⚠️ Completion request failed: {req_error}")
+                    if view_id:
+                        try:
+                            error_view = {
+                                "type": "modal",
+                                "callback_id": "completion_request_error",
+                                "title": {"type": "plain_text", "text": "完了申請"},
+                                "close": {"type": "plain_text", "text": "閉じる"},
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": f"⚠️ *完了申請に失敗しました*\n{req_error}"
+                                        }
+                                    }
+                                ]
+                            }
+                            slack_service.client.views_update(view_id=view_id, view=error_view)
+                        except Exception as update_error:
+                            print(f"⚠️ 完了申請エラービューの表示に失敗: {update_error}")
+
+            asyncio.create_task(run_completion_request())
+
+            return JSONResponse(
+                content={
+                    "response_action": "update",
+                    "view": loading_view,
+                }
+            )
+
+        elif callback_id == "completion_reject_modal":
+            values = view["state"]["values"]
+            private_metadata = json.loads(view.get("private_metadata", "{}"))
+
+            new_due_ts = values.get("new_due_block", {}).get("new_due_picker", {}).get("selected_date_time")
+            reason = values.get("reason_block", {}).get("reason_input", {}).get("value", "").strip()
+
+            if not new_due_ts:
+                return JSONResponse(
+                    content={
+                        "response_action": "errors",
+                        "errors": {"new_due_block": "新しい納期を選択してください"},
+                    }
+                )
+
+            if not reason:
+                return JSONResponse(
+                    content={
+                        "response_action": "errors",
+                        "errors": {"reason_block": "却下理由を入力してください"},
+                    }
+                )
+
+            page_id = private_metadata.get("page_id")
+            assignee_slack_id = private_metadata.get("assignee_slack_id")
+            requester_slack_id = private_metadata.get("requester_slack_id") or payload.get("user", {}).get("id")
+            new_due = datetime.fromtimestamp(new_due_ts, tz=timezone.utc).astimezone(JST)
+
+            snapshot = await notion_service.get_task_snapshot(page_id)
+
+            await notion_service.reject_completion(page_id, new_due, reason)
+            await notion_service.record_audit_log(
+                task_page_id=page_id,
+                event_type="完了却下",
+                detail=f"新しい納期: {_format_datetime_text(new_due)}\n理由: {reason}",
+                actor_email=snapshot.requester_email if snapshot else None,
+            )
+
+            if snapshot:
+                await slack_service.notify_completion_rejected(
+                    assignee_slack_id=assignee_slack_id,
+                    requester_slack_id=requester_slack_id,
+                    snapshot=snapshot,
+                    reason=reason,
+                    new_due=new_due,
+                )
+
+            return JSONResponse(content={})
+
         else:
             print(f"⚠️ Unknown callback_id: {callback_id}")
 
@@ -1123,14 +1478,63 @@ def _replace_actions_with_context(blocks: List[Dict[str, Any]], text: str) -> Li
     return updated_blocks
 
 
+def _mark_read_update_blocks(blocks: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    updated: List[Dict[str, Any]] = []
+    context_added = False
+
+    for block in blocks:
+        if block.get("type") == "actions":
+            elements = block.get("elements", [])
+            remaining = [el for el in elements if el.get("action_id") != "mark_reminder_read"]
+
+            if remaining:
+                updated.append({**block, "elements": remaining})
+            if not context_added:
+                updated.append(
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": text}],
+                    }
+                )
+                context_added = True
+        else:
+            updated.append(block)
+
+    if not context_added:
+        updated.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": text}],
+            }
+        )
+
+    return updated
+
+
 def _format_datetime_text(value: Optional[datetime]) -> str:
     if not value:
         return "-"
     if value.tzinfo:
-        localized = value.astimezone()
+        localized = value.astimezone(JST)
     else:
-        localized = value
+        localized = value.replace(tzinfo=JST)
     return localized.strftime("%Y-%m-%d %H:%M")
+
+
+def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=JST).astimezone(timezone.utc)
+
+
+def _requested_on_time(requested_at: Optional[datetime], due: Optional[datetime]) -> bool:
+    req_utc = _to_utc(requested_at)
+    due_utc = _to_utc(due)
+    if not req_utc or not due_utc:
+        return False
+    return req_utc <= due_utc
 
 
 def _extract_plain_text_from_rich_text(rich_text: Dict[str, Any]) -> str:
@@ -1219,7 +1623,7 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
         if "due_date_block" in values:
             due_date_unix = values["due_date_block"].get("due_date_picker", {}).get("selected_date_time")
             if due_date_unix:
-                due_date = datetime.fromtimestamp(due_date_unix)
+                due_date = datetime.fromtimestamp(due_date_unix, tz=timezone.utc).astimezone(JST)
                 task_info.due_date = due_date.strftime('%Y年%m月%d日 %H:%M')
         
         # 現在の内容
