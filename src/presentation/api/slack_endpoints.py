@@ -1417,27 +1417,93 @@ async def handle_interactive(request: Request):
             assignee_slack_id = private_metadata.get("assignee_slack_id")
             requester_slack_id = private_metadata.get("requester_slack_id") or payload.get("user", {}).get("id")
             new_due = datetime.fromtimestamp(new_due_ts, tz=timezone.utc).astimezone(JST)
+            view_id = view.get("id")
 
-            snapshot = await notion_service.get_task_snapshot(page_id)
+            loading_view = {
+                "type": "modal",
+                "callback_id": "completion_reject_loading",
+                "title": {"type": "plain_text", "text": "完了却下"},
+                "close": {"type": "plain_text", "text": "閉じる"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "⏳ *完了申請を却下しています...*\n数秒お待ちください。"
+                        }
+                    }
+                ]
+            }
 
-            await notion_service.reject_completion(page_id, new_due, reason)
-            await notion_service.record_audit_log(
-                task_page_id=page_id,
-                event_type="完了却下",
-                detail=f"新しい納期: {_format_datetime_text(new_due)}\n理由: {reason}",
-                actor_email=snapshot.requester_email if snapshot else None,
+            import asyncio
+
+            async def run_completion_rejection():
+                try:
+                    snapshot = await notion_service.get_task_snapshot(page_id)
+
+                    await notion_service.reject_completion(page_id, new_due, reason)
+                    await notion_service.record_audit_log(
+                        task_page_id=page_id,
+                        event_type="完了却下",
+                        detail=f"新しい納期: {_format_datetime_text(new_due)}\n理由: {reason}",
+                        actor_email=snapshot.requester_email if snapshot else None,
+                    )
+
+                    if snapshot:
+                        await slack_service.notify_completion_rejected(
+                            assignee_slack_id=assignee_slack_id,
+                            requester_slack_id=requester_slack_id,
+                            snapshot=snapshot,
+                            reason=reason,
+                            new_due=new_due,
+                        )
+
+                    if view_id:
+                        try:
+                            success_view = {
+                                "type": "modal",
+                                "callback_id": "completion_reject_success",
+                                "title": {"type": "plain_text", "text": "完了却下"},
+                                "close": {"type": "plain_text", "text": "閉じる"},
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": f"⚠️ *完了申請を却下しました*\n新しい納期: {_format_datetime_text(new_due)}"
+                                        }
+                                    }
+                                ]
+                            }
+                            slack_service.client.views_update(view_id=view_id, view=success_view)
+                        except Exception as update_error:
+                            print(f"⚠️ 完了却下成功ビューの表示に失敗: {update_error}")
+
+                except Exception as reject_error:
+                    print(f"⚠️ Completion rejection failed: {reject_error}")
+                    if view_id:
+                        try:
+                            error_view = {
+                                "type": "modal",
+                                "callback_id": "completion_reject_modal",
+                                "title": {"type": "plain_text", "text": "完了却下"},
+                                "submit": {"type": "plain_text", "text": "送信"},
+                                "close": {"type": "plain_text", "text": "キャンセル"},
+                                "blocks": view.get("blocks", []),
+                                "private_metadata": view.get("private_metadata", "{}"),
+                            }
+                            slack_service.client.views_update(view_id=view_id, view=error_view)
+                        except Exception as update_error:
+                            print(f"⚠️ 完了却下エラービューの表示に失敗: {update_error}")
+
+            asyncio.create_task(run_completion_rejection())
+
+            return JSONResponse(
+                content={
+                    "response_action": "update",
+                    "view": loading_view,
+                }
             )
-
-            if snapshot:
-                await slack_service.notify_completion_rejected(
-                    assignee_slack_id=assignee_slack_id,
-                    requester_slack_id=requester_slack_id,
-                    snapshot=snapshot,
-                    reason=reason,
-                    new_due=new_due,
-                )
-
-            return JSONResponse(content={})
 
         else:
             print(f"⚠️ Unknown callback_id: {callback_id}")
