@@ -3,7 +3,12 @@ from src.domain.entities.task import TaskRequest, TaskStatus
 from src.domain.entities.user import User
 from src.domain.repositories.task_repository import TaskRepositoryInterface
 from src.domain.repositories.user_repository import UserRepositoryInterface
-from src.application.dto.task_dto import CreateTaskRequestDto, TaskApprovalDto, TaskResponseDto
+from src.application.dto.task_dto import (
+    CreateTaskRequestDto,
+    TaskApprovalDto,
+    TaskResponseDto,
+    ReviseTaskRequestDto,
+)
 
 
 class TaskApplicationService:
@@ -74,6 +79,65 @@ class TaskApplicationService:
         )
 
         return self._to_response_dto(saved_task)
+
+    async def revise_task_request(self, dto: ReviseTaskRequestDto) -> TaskResponseDto:
+        """差し戻されたタスクを修正して再送信"""
+        task = await self.task_repository.find_by_id(dto.task_id)
+        if not task:
+            raise ValueError(f"Task not found: {dto.task_id}")
+
+        if task.requester_slack_id != dto.requester_slack_id:
+            raise ValueError("Only the original requester can revise this task")
+
+        requester_info = await self.slack_service.get_user_info(dto.requester_slack_id)
+        assignee_info = await self.slack_service.get_user_info(dto.assignee_slack_id)
+
+        requester_email = requester_info.get("profile", {}).get("email")
+        assignee_email = assignee_info.get("profile", {}).get("email")
+
+        task.revise(
+            assignee_slack_id=dto.assignee_slack_id,
+            title=dto.title,
+            description=dto.description,
+            due_date=dto.due_date,
+            task_type=dto.task_type,
+            urgency=dto.urgency,
+        )
+
+        if task.notion_page_id:
+            await self.notion_service.update_task_revision(
+                task=task,
+                requester_email=requester_email,
+                assignee_email=assignee_email,
+            )
+        else:
+            notion_page_id = await self.notion_service.create_task(
+                task=task,
+                requester_email=requester_email,
+                assignee_email=assignee_email,
+            )
+            if not notion_page_id:
+                raise ValueError("Notionへのタスク更新に失敗しました。サーバーログを確認してください。")
+            task.notion_page_id = notion_page_id
+
+        updated_task = await self.task_repository.update(task)
+
+        requester_name = requester_info.get("real_name") or requester_info.get("profile", {}).get("real_name", "Unknown")
+
+        await self.slack_service.send_approval_request(
+            assignee_slack_id=dto.assignee_slack_id,
+            task=updated_task,
+            requester_name=requester_name,
+        )
+
+        await self.notion_service.record_audit_log(
+            task_page_id=task.notion_page_id,
+            event_type="再依頼",
+            detail=f"タスクを修正して再送信\n納期: {dto.due_date.strftime('%Y-%m-%d %H:%M')}",
+            actor_email=requester_email,
+        )
+
+        return self._to_response_dto(updated_task)
 
     async def handle_task_approval(self, dto: TaskApprovalDto) -> TaskResponseDto:
         """タスクの承認/差し戻しを処理"""

@@ -1298,4 +1298,315 @@ class DynamicNotionService:
         except Exception as e:
             print(f"Error updating Notion task: {e}")
             raise
+
+    async def update_task_revision(
+        self,
+        task: TaskRequest,
+        requester_email: Optional[str],
+        assignee_email: Optional[str],
+    ) -> None:
+        """差し戻し後のタスク内容を更新"""
+        if not task.notion_page_id:
+            return
+
+        requester_user: Optional[NotionUser] = None
+        assignee_user: Optional[NotionUser] = None
+        try:
+            requester_user, assignee_user = await self.user_mapping_service.get_notion_user_for_task_creation(
+                requester_email,
+                assignee_email,
+            )
+        except Exception as mapping_error:
+            print(f"⚠️ Failed to resolve Notion users during revision: {mapping_error}")
+
+        properties: Dict[str, Any] = {
+            TASK_PROP_TITLE: {
+                "title": [
+                    {
+                        "text": {"content": task.title},
+                    }
+                ],
+            },
+            TASK_PROP_DUE: {
+                "date": {"start": task.due_date.isoformat()},
+            },
+            TASK_PROP_STATUS: {
+                "select": {"name": self._get_status_name(task.status.value)},
+            },
+            "タスク種類": {
+                "select": {"name": task.task_type},
+            },
+            "緊急度": {
+                "select": {"name": task.urgency},
+            },
+            TASK_PROP_REMINDER_STAGE: {
+                "select": {"name": REMINDER_STAGE_NOT_SENT},
+            },
+            TASK_PROP_REMINDER_READ: {
+                "checkbox": False,
+            },
+            TASK_PROP_LAST_REMIND_AT: {
+                "date": None,
+            },
+            TASK_PROP_LAST_READ_AT: {
+                "date": None,
+            },
+            TASK_PROP_EXTENSION_STATUS: {
+                "select": {"name": EXTENSION_STATUS_NONE},
+            },
+            TASK_PROP_EXTENSION_DUE: {
+                "date": None,
+            },
+            TASK_PROP_EXTENSION_REASON: {
+                "rich_text": [],
+            },
+            TASK_PROP_OVERDUE_POINTS: {
+                "number": 0,
+            },
+            TASK_PROP_COMPLETION_STATUS: {
+                "select": {"name": COMPLETION_STATUS_IN_PROGRESS},
+            },
+            TASK_PROP_COMPLETION_REQUESTED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_APPROVED_AT: {
+                "date": None,
+            },
+            TASK_PROP_COMPLETION_NOTE: {
+                "rich_text": [],
+            },
+            TASK_PROP_COMPLETION_REJECT_REASON: {
+                "rich_text": [],
+            },
+        }
+
+        if requester_user:
+            properties[TASK_PROP_REQUESTER] = {
+                "people": [
+                    {
+                        "object": "user",
+                        "id": str(requester_user.user_id),
+                    }
+                ]
+            }
+        elif requester_email:
+            properties[TASK_PROP_REQUESTER] = {"people": []}
+
+        if assignee_user:
+            properties[TASK_PROP_ASSIGNEE] = {
+                "people": [
+                    {
+                        "object": "user",
+                        "id": str(assignee_user.user_id),
+                    }
+                ]
+            }
+        elif assignee_email:
+            properties[TASK_PROP_ASSIGNEE] = {"people": []}
+
+        try:
+            self.client.pages.update(page_id=task.notion_page_id, properties=properties)
+        except Exception as update_error:
+            print(f"⚠️ Failed to update Notion task properties on revision: {update_error}")
+            return
+
+        try:
+            await self._refresh_revision_content(
+                page_id=task.notion_page_id,
+                task=task,
+                requester_email=requester_email,
+                assignee_email=assignee_email,
+            )
+        except Exception as content_error:
+            print(f"⚠️ Failed to refresh Notion task content on revision: {content_error}")
+
+    async def _refresh_revision_content(
+        self,
+        page_id: str,
+        task: TaskRequest,
+        requester_email: Optional[str],
+        assignee_email: Optional[str],
+    ) -> None:
+        children = self._list_page_children(page_id)
+        self._update_task_summary_callout(children, task, requester_email, assignee_email)
+        self._update_description_section(page_id, children, task.description)
+
+    def _list_page_children(self, page_id: str) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        start_cursor: Optional[str] = None
+
+        while True:
+            response = self.client.blocks.children.list(
+                block_id=page_id,
+                start_cursor=start_cursor,
+                page_size=100,
+            )
+            results.extend(response.get("results", []))
+            if not response.get("has_more"):
+                break
+            start_cursor = response.get("next_cursor")
+
+        return results
+
+    def _update_task_summary_callout(
+        self,
+        children: List[Dict[str, Any]],
+        task: TaskRequest,
+        requester_email: Optional[str],
+        assignee_email: Optional[str],
+    ) -> None:
+        for block in children:
+            if block.get("type") != "callout":
+                continue
+
+            callout_info = block.get("callout", {})
+            icon = callout_info.get("icon") or {"emoji": "ℹ️"}
+            color = callout_info.get("color", "blue_background")
+
+            summary_text = (
+                f"依頼者: {requester_email or 'Unknown'}\n"
+                f"依頼先: {assignee_email or 'Unknown'}\n"
+                f"納期: {task.due_date.astimezone(JST).strftime('%Y年%m月%d日 %H:%M')}\n"
+                f"タスク種類: {task.task_type}\n"
+                f"緊急度: {task.urgency}"
+            )
+
+            try:
+                self.client.blocks.update(
+                    block_id=block["id"],
+                    callout={
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": summary_text},
+                            }
+                        ],
+                        "icon": icon,
+                        "color": color,
+                    },
+                )
+            except Exception as update_error:
+                print(f"⚠️ Failed to update summary callout: {update_error}")
+            finally:
+                break
+
+    def _update_description_section(
+        self,
+        page_id: str,
+        children: List[Dict[str, Any]],
+        description: Optional[Union[str, Dict[str, Any]]],
+    ) -> None:
+        description_blocks = (
+            self._convert_slack_rich_text_to_notion(description)
+            if description
+            else []
+        )
+
+        description_heading_index: Optional[int] = None
+        progress_heading_index: Optional[int] = None
+
+        for idx, block in enumerate(children):
+            if block.get("type") != "heading_2":
+                continue
+
+            heading_text = self._rich_text_to_plain(block["heading_2"].get("rich_text", []))
+            if heading_text.startswith("📝 タスク内容"):
+                description_heading_index = idx
+            elif heading_text.startswith("✅ 進捗メモ"):
+                progress_heading_index = idx
+                break
+
+        if description_blocks:
+            if description_heading_index is None:
+                divider_block = next((b for b in children if b.get("type") == "divider"), None)
+                insert_after = divider_block["id"] if divider_block else (children[0]["id"] if children else None)
+
+                heading_block = {
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": "📝 タスク内容"},
+                            }
+                        ],
+                    },
+                }
+
+                try:
+                    append_response = self.client.blocks.children.append(
+                        block_id=page_id,
+                        children=[heading_block],
+                        **({"after": insert_after} if insert_after else {}),
+                    )
+                    results = append_response.get("results", [])
+                    if not results or not results[0].get("id"):
+                        print("⚠️ Failed to obtain heading id after insertion")
+                        return
+                    heading_id = results[0]["id"]
+                except Exception as append_error:
+                    print(f"⚠️ Failed to insert description heading: {append_error}")
+                    return
+            else:
+                heading_id = children[description_heading_index]["id"]
+                end_index = self._find_description_end(children, description_heading_index, progress_heading_index)
+                for block in children[description_heading_index + 1 : end_index]:
+                    try:
+                        self.client.blocks.update(block_id=block["id"], archived=True)
+                    except Exception as archive_error:
+                        print(f"⚠️ Failed to archive old description block: {archive_error}")
+
+            after_id = heading_id
+            for block in description_blocks:
+                try:
+                    response = self.client.blocks.children.append(
+                        block_id=page_id,
+                        children=[block],
+                        after=after_id,
+                    )
+                    results = response.get("results", [])
+                    if results and results[0].get("id"):
+                        after_id = results[0]["id"]
+                except Exception as append_error:
+                    print(f"⚠️ Failed to append description block: {append_error}")
+                    try:
+                        fallback_response = self.client.blocks.children.append(block_id=page_id, children=[block])
+                        results = fallback_response.get("results", [])
+                        if results and results[0].get("id"):
+                            after_id = results[0]["id"]
+                    except Exception as fallback_error:
+                        print(f"⚠️ Failed to append description block (fallback): {fallback_error}")
+                        break
+        else:
+            if description_heading_index is not None:
+                end_index = self._find_description_end(children, description_heading_index, progress_heading_index)
+                for block in children[description_heading_index + 1 : end_index]:
+                    try:
+                        self.client.blocks.update(block_id=block["id"], archived=True)
+                    except Exception as archive_error:
+                        print(f"⚠️ Failed to archive description block: {archive_error}")
+                try:
+                    self.client.blocks.update(block_id=children[description_heading_index]["id"], archived=True)
+                except Exception as archive_error:
+                    print(f"⚠️ Failed to archive description heading: {archive_error}")
+
+    def _find_description_end(
+        self,
+        children: List[Dict[str, Any]],
+        heading_index: int,
+        progress_heading_index: Optional[int],
+    ) -> int:
+        for idx in range(heading_index + 1, len(children)):
+            block = children[idx]
+            if block.get("type") == "divider" or block.get("type") == "heading_2":
+                return idx
+        return progress_heading_index or len(children)
+
+    def _rich_text_to_plain(self, rich_text: List[Dict[str, Any]]) -> str:
+        parts: List[str] = []
+        for item in rich_text:
+            if item.get("type") == "text":
+                parts.append(item.get("text", {}).get("content", ""))
+        return "".join(parts)
 JST = ZoneInfo("Asia/Tokyo")

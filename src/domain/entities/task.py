@@ -39,6 +39,27 @@ class TaskRequest:
         self.rejection_reason = reason
         self.updated_at = datetime.now()
 
+    def revise(
+        self,
+        *,
+        assignee_slack_id: str,
+        title: str,
+        description: Optional[Union[str, Dict[str, Any]]],
+        due_date: datetime,
+        task_type: str,
+        urgency: str,
+    ) -> None:
+        """タスク内容を修正して再送信できるようにする"""
+        self.assignee_slack_id = assignee_slack_id
+        self.title = title
+        self.description = description
+        self.due_date = due_date
+        self.task_type = task_type
+        self.urgency = urgency
+        self.status = TaskStatus.PENDING
+        self.rejection_reason = None
+        self.updated_at = datetime.now()
+
     def is_pending(self) -> bool:
         """承認待ち状態かどうか"""
         return self.status == TaskStatus.PENDING

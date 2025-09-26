@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request, HTTPException, Form, Depends
 from fastapi.responses import JSONResponse
 from typing import Dict, Any, Optional, List
 from src.application.services.task_service import TaskApplicationService
-from src.application.dto.task_dto import CreateTaskRequestDto, TaskApprovalDto
+from src.application.dto.task_dto import CreateTaskRequestDto, TaskApprovalDto, ReviseTaskRequestDto
 from src.infrastructure.slack.slack_service import SlackService, REMINDER_STAGE_LABELS
 from src.infrastructure.notion.dynamic_notion_service import (
     DynamicNotionService,
@@ -584,6 +584,62 @@ async def handle_interactive(request: Request):
             await slack_service.open_rejection_modal(trigger_id, task_id)
             return JSONResponse(content={})
 
+        elif action_id == "open_revision_modal":
+            try:
+                value_data = json.loads(action.get("value", "{}"))
+            except json.JSONDecodeError:
+                print("⚠️ Invalid payload for open_revision_modal")
+                return JSONResponse(content={})
+
+            task_id = value_data.get("task_id")
+            if not task_id:
+                return JSONResponse(content={})
+
+            task = await task_service.task_repository.find_by_id(task_id)
+            if not task:
+                try:
+                    dm = slack_service.client.conversations_open(users=user_id)
+                    slack_service.client.chat_postMessage(
+                        channel=dm["channel"]["id"],
+                        text="タスク情報が見つかりませんでした。新しく依頼を作成してください。",
+                    )
+                except Exception as dm_error:
+                    print(f"⚠️ Failed to notify requester about missing task: {dm_error}")
+                return JSONResponse(content={})
+
+            if task.requester_slack_id != user_id:
+                try:
+                    dm = slack_service.client.conversations_open(users=user_id)
+                    slack_service.client.chat_postMessage(
+                        channel=dm["channel"]["id"],
+                        text="この差し戻しタスクを修正できるのは依頼者のみです。",
+                    )
+                except Exception as dm_error:
+                    print(f"⚠️ Failed to notify non-requester user: {dm_error}")
+                return JSONResponse(content={})
+
+            source_channel = payload.get("channel", {}).get("id")
+            message = payload.get("message", {})
+            source_ts = message.get("ts")
+
+            metadata: Dict[str, Any] = {}
+            if source_channel:
+                metadata["source_channel"] = source_channel
+            if source_ts:
+                metadata["source_ts"] = source_ts
+            if task.rejection_reason:
+                metadata["rejection_reason"] = task.rejection_reason
+
+            await slack_service.open_task_revision_modal(
+                trigger_id=trigger_id,
+                task=task,
+                requester_slack_id=user_id,
+                private_metadata=metadata,
+                rejection_reason=task.rejection_reason,
+            )
+
+            return JSONResponse(content={})
+
         elif action_id == "mark_reminder_read":
             try:
                 value_data = json.loads(action.get("value", "{}"))
@@ -1149,6 +1205,169 @@ async def handle_interactive(request: Request):
                         }
                     }
                 )
+
+        elif callback_id == "revise_task_modal":
+            values = view["state"]["values"]
+            private_metadata = json.loads(view.get("private_metadata", "{}"))
+            view_id = view.get("id")
+
+            task_id = private_metadata.get("task_id")
+            requester_slack_id = private_metadata.get("requester_slack_id") or payload.get("user", {}).get("id")
+            if not task_id or not requester_slack_id:
+                return JSONResponse(content={"response_action": "clear"})
+
+            assignee_option = values.get("assignee_block", {}).get("assignee_select", {}).get("selected_option")
+            title_value = values.get("title_block", {}).get("title_input", {}).get("value")
+            due_picker = values.get("due_date_block", {}).get("due_date_picker", {})
+
+            if not assignee_option or not title_value or not due_picker.get("selected_date_time"):
+                errors: Dict[str, Optional[str]] = {}
+                if not assignee_option:
+                    errors["assignee_block"] = "依頼先を選択してください"
+                if not title_value:
+                    errors["title_block"] = "件名を入力してください"
+                if not due_picker.get("selected_date_time"):
+                    errors["due_date_block"] = "納期を選択してください"
+                return JSONResponse(
+                    content={
+                        "response_action": "errors",
+                        "errors": errors,
+                    }
+                )
+
+            task_type_option = values.get("task_type_block", {}).get("task_type_select", {}).get("selected_option")
+            urgency_option = values.get("urgency_block", {}).get("urgency_select", {}).get("selected_option")
+
+            task_type = task_type_option["value"] if task_type_option else "社内タスク"
+            urgency = urgency_option["value"] if urgency_option else "1週間以内"
+
+            description_data = None
+            description_payload = values.get("description_block", {}).get("description_input", {})
+            if description_payload.get("rich_text_value"):
+                description_data = description_payload.get("rich_text_value")
+
+            due_date = datetime.fromtimestamp(due_picker["selected_date_time"], tz=timezone.utc).astimezone(JST)
+
+            dto = ReviseTaskRequestDto(
+                task_id=task_id,
+                requester_slack_id=requester_slack_id,
+                assignee_slack_id=assignee_option["value"],
+                title=title_value,
+                description=description_data,
+                due_date=due_date,
+                task_type=task_type,
+                urgency=urgency,
+            )
+
+            loading_view = {
+                "type": "modal",
+                "callback_id": "revise_task_modal_loading",
+                "title": {"type": "plain_text", "text": "タスク依頼を修正"},
+                "close": {"type": "plain_text", "text": "閉じる"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "⏳ *修正したタスクを送信しています...*\n数秒お待ちください。",
+                        },
+                    }
+                ],
+            }
+
+            source_channel = private_metadata.get("source_channel")
+            source_ts = private_metadata.get("source_ts")
+
+            import asyncio
+
+            async def run_task_revision():
+                try:
+                    response = await task_service.revise_task_request(dto)
+
+                    if source_channel and source_ts:
+                        try:
+                            formatted_due = _format_datetime_text(due_date)
+                            updated_blocks = [
+                                {
+                                    "type": "header",
+                                    "text": {"type": "plain_text", "text": "✏️ タスクを修正して再送信しました"},
+                                },
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": f"*件名:* {response.title}\n*依頼先:* <@{dto.assignee_slack_id}>\n*納期:* {formatted_due}",
+                                    },
+                                },
+                                {
+                                    "type": "context",
+                                    "elements": [
+                                        {"type": "mrkdwn", "text": "修正内容を送信し、再び承認待ちになりました。"},
+                                    ],
+                                },
+                            ]
+
+                            slack_service.client.chat_update(
+                                channel=source_channel,
+                                ts=source_ts,
+                                text="タスクを修正して再送しました",
+                                blocks=updated_blocks,
+                            )
+                        except Exception as update_error:
+                            print(f"⚠️ Failed to update rejection message after revision: {update_error}")
+
+                    if view_id:
+                        try:
+                            success_view = {
+                                "type": "modal",
+                                "callback_id": "revise_task_modal_success",
+                                "title": {"type": "plain_text", "text": "タスク依頼を修正"},
+                                "close": {"type": "plain_text", "text": "閉じる"},
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": "✅ *修正したタスクを送信しました*\n承認結果は依頼先からの通知をお待ちください。",
+                                        },
+                                    }
+                                ],
+                            }
+                            slack_service.client.views_update(view_id=view_id, view=success_view)
+                        except Exception as update_error:
+                            print(f"⚠️ 修正成功ビューの表示に失敗: {update_error}")
+
+                except Exception as revision_error:
+                    print(f"⚠️ Task revision failed: {revision_error}")
+                    if view_id:
+                        try:
+                            error_view = {
+                                "type": "modal",
+                                "callback_id": "revise_task_modal_error",
+                                "title": {"type": "plain_text", "text": "タスク依頼を修正"},
+                                "close": {"type": "plain_text", "text": "閉じる"},
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": f"⚠️ *修正したタスクの送信に失敗しました*\n{revision_error}",
+                                        },
+                                    }
+                                ],
+                            }
+                            slack_service.client.views_update(view_id=view_id, view=error_view)
+                        except Exception as update_error:
+                            print(f"⚠️ 修正エラービューの表示に失敗: {update_error}")
+
+            asyncio.create_task(run_task_revision())
+
+            return JSONResponse(
+                content={
+                    "response_action": "update",
+                    "view": loading_view,
+                }
+            )
 
         elif callback_id == "reject_task_modal":
             try:

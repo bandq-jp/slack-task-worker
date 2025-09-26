@@ -1,6 +1,7 @@
+import copy
 import json
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from src.domain.entities.task import TaskRequest
@@ -15,6 +16,21 @@ REMINDER_STAGE_LABELS = {
     "未送信": "ℹ️ リマインド準備中",
     "承認済": "✅ 承認済み",
 }
+
+TASK_TYPE_OPTIONS: List[Dict[str, Any]] = [
+    {"text": {"type": "plain_text", "text": "フリーランス関係"}, "value": "フリーランス関係"},
+    {"text": {"type": "plain_text", "text": "モノテック関連"}, "value": "モノテック関連"},
+    {"text": {"type": "plain_text", "text": "社内タスク"}, "value": "社内タスク"},
+    {"text": {"type": "plain_text", "text": "HH関連"}, "value": "HH関連"},
+    {"text": {"type": "plain_text", "text": "Sales関連"}, "value": "Sales関連"},
+    {"text": {"type": "plain_text", "text": "PL関連"}, "value": "PL関連"},
+]
+
+URGENCY_OPTIONS: List[Dict[str, Any]] = [
+    {"text": {"type": "plain_text", "text": "ノンコア社内タスク"}, "value": "ノンコア社内タスク"},
+    {"text": {"type": "plain_text", "text": "1週間以内"}, "value": "1週間以内"},
+    {"text": {"type": "plain_text", "text": "最重要"}, "value": "最重要"},
+]
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -51,6 +67,81 @@ class SlackService:
     def _datetimepicker_initial(self, value: Optional[datetime]) -> int:
         target = self._ensure_jst(value) or datetime.now(JST)
         return int(target.astimezone(timezone.utc).timestamp())
+
+    def _task_type_options(self) -> List[Dict[str, Any]]:
+        return copy.deepcopy(TASK_TYPE_OPTIONS)
+
+    def _urgency_options(self) -> List[Dict[str, Any]]:
+        return copy.deepcopy(URGENCY_OPTIONS)
+
+    def _get_user_select_options(
+        self, selected_user_id: Optional[str] = None
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, bool]:
+        users_response = self.client.users_list()
+        users = users_response["members"]
+
+        internal_users = [
+            user
+            for user in users
+            if not user.get("is_bot")
+            and not user.get("deleted")
+            and not user.get("is_restricted")
+            and not user.get("is_ultra_restricted")
+        ]
+
+        options: List[Dict[str, Any]] = []
+        initial_option: Optional[Dict[str, Any]] = None
+        max_users = min(len(internal_users), 100)
+        limit_hit = len(internal_users) > 100
+
+        for index, user in enumerate(internal_users):
+            if index >= max_users:
+                break
+            option = {
+                "text": {
+                    "type": "plain_text",
+                    "text": user.get("real_name", user.get("name", "Unknown")),
+                },
+                "value": user["id"],
+            }
+            options.append(option)
+
+            if selected_user_id and user["id"] == selected_user_id:
+                initial_option = option
+
+        if not initial_option and selected_user_id and options:
+            # 依頼先が社内メンバーリストに存在しない場合は最初の選択肢を初期値にする
+            initial_option = options[0]
+
+        return options, initial_option, len(internal_users), limit_hit
+
+    def _build_rich_text_initial(self, description: Optional[Any]) -> Optional[Dict[str, Any]]:
+        if not description:
+            return None
+
+        if isinstance(description, dict):
+            return copy.deepcopy(description)
+
+        if isinstance(description, str):
+            text = description.strip()
+            if not text:
+                return None
+            return {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {
+                                "type": "text",
+                                "text": text,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        return None
 
     async def get_user_info(self, user_id: str) -> Dict[str, Any]:
         """ユーザー情報を取得"""
@@ -220,6 +311,27 @@ class SlackService:
                         f"*差し戻し理由:* {task.rejection_reason}\n"
                         f"*差し戻し日時:* {task.updated_at.strftime('%Y-%m-%d %H:%M')}",
                     },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "text": {"type": "plain_text", "text": "✏️ 修正して再送", "emoji": True},
+                            "action_id": "open_revision_modal",
+                            "value": json.dumps({"task_id": task.id}),
+                        }
+                    ],
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "修正ボタンから内容を編集し、同じタスクを再送できます。",
+                        }
+                    ],
                 },
             ]
 
@@ -905,33 +1017,11 @@ class SlackService:
             view_id = open_resp["view"]["id"]
 
             # ユーザーリストの取得（少し時間がかかる可能性があるため open 後に実行）
-            users_response = self.client.users_list()
-            users = users_response["members"]
+            user_options, _, internal_count, limit_hit = self._get_user_select_options()
 
-            # ユーザー選択オプションを作成（社内メンバーのみ）
-            user_options = []
-            internal_users = [
-                user for user in users
-                if not user.get("is_bot")
-                and not user.get("deleted")
-                and not user.get("is_restricted")
-                and not user.get("is_ultra_restricted")
-            ]
-
-            max_users = min(len(internal_users), 100)
-            for i, user in enumerate(internal_users):
-                if i >= max_users:
-                    break
-                user_options.append(
-                    {
-                        "text": {"type": "plain_text", "text": user.get("real_name", user.get("name", "Unknown"))},
-                        "value": user["id"],
-                    }
-                )
-
-            print(f"📊 社内メンバー: {len(internal_users)}人（表示: {min(len(internal_users), 100)}人）")
-            if len(internal_users) > 100:
-                print(f"⚠️ ユーザー数制限により100人のみ表示")
+            print(f"📊 社内メンバー: {internal_count}人（表示: {min(internal_count, 100)}人）")
+            if limit_hit:
+                print("⚠️ ユーザー数制限により100人のみ表示")
 
             full_modal = {
                 "type": "modal",
@@ -973,14 +1063,7 @@ class SlackService:
                         "element": {
                             "type": "static_select",
                             "placeholder": {"type": "plain_text", "text": "タスク種類を選択"},
-                            "options": [
-                                {"text": {"type": "plain_text", "text": "フリーランス関係"}, "value": "フリーランス関係"},
-                                {"text": {"type": "plain_text", "text": "モノテック関連"}, "value": "モノテック関連"},
-                                {"text": {"type": "plain_text", "text": "社内タスク"}, "value": "社内タスク"},
-                                {"text": {"type": "plain_text", "text": "HH関連"}, "value": "HH関連"},
-                                {"text": {"type": "plain_text", "text": "Sales関連"}, "value": "Sales関連"},
-                                {"text": {"type": "plain_text", "text": "PL関連"}, "value": "PL関連"},
-                            ],
+                            "options": self._task_type_options(),
                             "action_id": "task_type_select",
                         },
                         "label": {"type": "plain_text", "text": "タスク種類"},
@@ -991,11 +1074,7 @@ class SlackService:
                         "element": {
                             "type": "static_select",
                             "placeholder": {"type": "plain_text", "text": "緊急度を選択"},
-                            "options": [
-                                {"text": {"type": "plain_text", "text": "ノンコア社内タスク"}, "value": "ノンコア社内タスク"},
-                                {"text": {"type": "plain_text", "text": "1週間以内"}, "value": "1週間以内"},
-                                {"text": {"type": "plain_text", "text": "最重要"}, "value": "最重要"},
-                            ],
+                            "options": self._urgency_options(),
                             "action_id": "urgency_select",
                         },
                         "label": {"type": "plain_text", "text": "緊急度"},
@@ -1031,6 +1110,172 @@ class SlackService:
 
         except SlackApiError as e:
             print(f"Error opening modal: {e}")
+            raise
+
+    async def open_task_revision_modal(
+        self,
+        trigger_id: str,
+        task: TaskRequest,
+        requester_slack_id: str,
+        private_metadata: Dict[str, Any],
+        rejection_reason: Optional[str] = None,
+    ):
+        """差し戻し後のタスク修正モーダルを開く"""
+        try:
+            loading_modal = {
+                "type": "modal",
+                "callback_id": "revise_task_modal_loading",
+                "title": {"type": "plain_text", "text": f"タスク依頼を修正{self.app_name_suffix}"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ 初期化中…"}}
+                ],
+                "private_metadata": json.dumps({"task_id": task.id, **private_metadata}),
+            }
+
+            open_resp = self.client.views_open(trigger_id=trigger_id, view=loading_modal)
+            view_id = open_resp["view"]["id"]
+
+            assignee_options, assignee_initial, internal_count, limit_hit = self._get_user_select_options(
+                selected_user_id=task.assignee_slack_id
+            )
+
+            print(f"✏️ 修正モーダル: 社内メンバー {internal_count}人（表示: {min(internal_count, 100)}人）")
+            if limit_hit:
+                print("⚠️ ユーザー数制限により100人のみ表示")
+
+            task_type_options = self._task_type_options()
+            task_type_initial = next(
+                (option for option in task_type_options if option.get("value") == task.task_type),
+                task_type_options[0] if task_type_options else None,
+            )
+
+            urgency_options = self._urgency_options()
+            urgency_initial = next(
+                (option for option in urgency_options if option.get("value") == task.urgency),
+                urgency_options[0] if urgency_options else None,
+            )
+
+            description_initial = self._build_rich_text_initial(task.description)
+
+            metadata_payload = json.dumps(
+                {
+                    "task_id": task.id,
+                    "requester_slack_id": requester_slack_id,
+                    **private_metadata,
+                }
+            )
+
+            informational_blocks: List[Dict[str, Any]] = []
+            if rejection_reason:
+                informational_blocks.append(
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"⚠️ *差し戻し理由:*\n{rejection_reason}",
+                        },
+                    }
+                )
+
+            full_modal_blocks: List[Dict[str, Any]] = informational_blocks + [
+                {
+                    "type": "input",
+                    "block_id": "assignee_block",
+                    "element": {
+                        "type": "static_select",
+                        "placeholder": {"type": "plain_text", "text": "依頼先を選択"},
+                        "options": assignee_options,
+                        "action_id": "assignee_select",
+                        **({"initial_option": assignee_initial} if assignee_initial else {}),
+                    },
+                    "label": {"type": "plain_text", "text": "依頼先"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "title_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "title_input",
+                        "initial_value": task.title,
+                    },
+                    "label": {"type": "plain_text", "text": "件名"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "due_date_block",
+                    "element": {
+                        "type": "datetimepicker",
+                        "action_id": "due_date_picker",
+                        "initial_date_time": self._datetimepicker_initial(task.due_date),
+                    },
+                    "label": {"type": "plain_text", "text": "納期"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "task_type_block",
+                    "element": {
+                        "type": "static_select",
+                        "placeholder": {"type": "plain_text", "text": "タスク種類を選択"},
+                        "options": task_type_options,
+                        "action_id": "task_type_select",
+                        **({"initial_option": task_type_initial} if task_type_initial else {}),
+                    },
+                    "label": {"type": "plain_text", "text": "タスク種類"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "urgency_block",
+                    "element": {
+                        "type": "static_select",
+                        "placeholder": {"type": "plain_text", "text": "緊急度を選択"},
+                        "options": urgency_options,
+                        "action_id": "urgency_select",
+                        **({"initial_option": urgency_initial} if urgency_initial else {}),
+                    },
+                    "label": {"type": "plain_text", "text": "緊急度"},
+                },
+                {
+                    "type": "section",
+                    "block_id": "ai_helper_section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "🤖 *AI補完機能*\nタスク内容をAIに整形・改善してもらえます",
+                    },
+                    "accessory": {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "AI補完", "emoji": True},
+                        "value": "ai_enhance",
+                        "action_id": "ai_enhance_button",
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "description_block",
+                    "element": {
+                        "type": "rich_text_input",
+                        "action_id": "description_input",
+                        **({"initial_value": description_initial} if description_initial else {}),
+                    },
+                    "label": {"type": "plain_text", "text": "内容詳細"},
+                    "optional": True,
+                },
+            ]
+
+            full_modal = {
+                "type": "modal",
+                "callback_id": "revise_task_modal",
+                "title": {"type": "plain_text", "text": f"タスク依頼を修正{self.app_name_suffix}"},
+                "submit": {"type": "plain_text", "text": "再送信"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
+                "blocks": full_modal_blocks,
+                "private_metadata": metadata_payload,
+            }
+
+            self.client.views_update(view_id=view_id, view=full_modal)
+
+        except SlackApiError as e:
+            print(f"Error opening revision modal: {e}")
             raise
 
     async def open_rejection_modal(self, trigger_id: str, task_id: str):

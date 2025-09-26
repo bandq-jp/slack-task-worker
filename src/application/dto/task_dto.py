@@ -20,6 +20,18 @@ class CreateTaskRequestDto(BaseModel):
     urgency: str = Field(..., description="緊急度")
 
 
+class ReviseTaskRequestDto(BaseModel):
+    """タスク修正リクエストDTO"""
+    task_id: str = Field(..., description="既存タスクID")
+    requester_slack_id: str = Field(..., description="依頼者のSlackユーザーID")
+    assignee_slack_id: str = Field(..., description="依頼先のSlackユーザーID")
+    title: str = Field(..., description="タスクタイトル")
+    description: Optional[Union[str, Dict[str, Any]]] = Field(None, description="タスク内容（プレーンテキストまたはリッチテキスト）")
+    due_date: datetime = Field(..., description="納期")
+    task_type: str = Field(..., description="タスク種類")
+    urgency: str = Field(..., description="緊急度")
+
+
 class TaskApprovalDto(BaseModel):
     """タスク承認/差し戻しDTO"""
     task_id: str = Field(..., description="タスクID")
