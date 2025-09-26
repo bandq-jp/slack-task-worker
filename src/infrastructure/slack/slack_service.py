@@ -13,6 +13,7 @@ REMINDER_STAGE_LABELS = {
     "超過": "⚠️ 納期超過",
     "既読": "✅ 既読済み",
     "未送信": "ℹ️ リマインド準備中",
+    "承認済": "✅ 承認済み",
 }
 
 JST = ZoneInfo("Asia/Tokyo")

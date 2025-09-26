@@ -348,11 +348,12 @@ async def handle_interactive(request: Request):
                             action="approve",
                             rejection_reason=None,
                         )
-                        await task_service.handle_task_approval(dto)
+                        approval_result = await task_service.handle_task_approval(dto)
                         print("✅ 承認処理成功")
 
                         # Google Calendar にタスクを追加（オプショナル）
-                        calendar_status = ""
+                        calendar_notes: List[str] = []
+                        saved_task = None
                         if calendar_task_service:
                             try:
                                 # まずTaskRequestを取得してnotion_page_idを確認
@@ -372,19 +373,19 @@ async def handle_interactive(request: Request):
                                         )
 
                                         if calendar_task:
-                                            calendar_status = "\n📅 Googleカレンダーのタスクに追加しました"
+                                            calendar_notes.append("📅 Googleカレンダーのタスクに追加しました")
                                             print("✅ Google Calendar task created")
                                         else:
-                                            calendar_status = "\n⚠️ Googleカレンダーへの追加はスキップされました（メールアドレスが見つかりません）"
+                                            calendar_notes.append("⚠️ Googleカレンダーへの追加はスキップされました（メールアドレスが見つかりません）")
                                     else:
-                                        calendar_status = "\n⚠️ Notionからタスクデータを取得できませんでした"
+                                        calendar_notes.append("⚠️ Notionからタスクデータを取得できませんでした")
                                         print(f"⚠️ Could not get task data from Notion for page_id: {saved_task.notion_page_id}")
                                 else:
-                                    calendar_status = "\n⚠️ タスクまたはNotionページIDが見つかりません"
+                                    calendar_notes.append("⚠️ タスクまたはNotionページIDが見つかりません")
                                     print(f"⚠️ TaskRequest not found or missing notion_page_id: task_id={task_id}")
                             except Exception as cal_error:
                                 print(f"⚠️ Calendar task creation error: {cal_error}")
-                                calendar_status = "\n⚠️ Googleカレンダーへの追加に失敗しました"
+                                calendar_notes.append("⚠️ Googleカレンダーへの追加に失敗しました")
 
                         # 成功メッセージを表示（チャンネル、TS、メッセージIDが必要）
                         # Slack メッセージ更新のためのチャンネルとTSを取得
@@ -394,19 +395,124 @@ async def handle_interactive(request: Request):
                         
                         if channel and message_ts:
                             try:
+                                if not saved_task:
+                                    saved_task = await task_service.task_repository.find_by_id(task_id)
+
+                                notion_page_id = approval_result.notion_page_id or (
+                                    saved_task.notion_page_id if saved_task else None
+                                )
+                                requester_slack_id = approval_result.requester_slack_id or (
+                                    saved_task.requester_slack_id if saved_task else None
+                                )
+                                title_text = (approval_result.title or (saved_task.title if saved_task else "タスク")).strip()
+                                title_text = title_text.replace("\n", " ")
+                                stage_label = REMINDER_STAGE_LABELS.get("承認済", "承認済み")
+                                header_text = f"{stage_label} - {title_text}"[:150]
+
+                                status_lines = ["✅ このタスクは承認され、Notionに登録されました"]
+                                status_lines.extend(calendar_notes)
+                                status_text = "\n".join(status_lines)
+
+                                blocks: List[Dict[str, Any]] = [
+                                    {
+                                        "type": "header",
+                                        "text": {"type": "plain_text", "text": header_text, "emoji": True},
+                                    },
+                                    {
+                                        "type": "section",
+                                        "text": {"type": "mrkdwn", "text": status_text},
+                                    },
+                                ]
+
+                                action_payload = None
+                                notion_url = None
+                                if notion_page_id:
+                                    notion_url = f"https://www.notion.so/{notion_page_id.replace('-', '')}"
+                                    title_display = title_text or "(件名未設定)"
+                                    due_source = approval_result.due_date or (saved_task.due_date if saved_task else None)
+                                    due_text = _format_datetime_text(due_source)
+
+                                    blocks.append(
+                                        {
+                                            "type": "section",
+                                            "fields": [
+                                                {
+                                                    "type": "mrkdwn",
+                                                    "text": f"件名: <{notion_url}|{title_display}>",
+                                                },
+                                                {
+                                                    "type": "mrkdwn",
+                                                    "text": f"納期: {due_text if due_text else '-'}",
+                                                },
+                                            ],
+                                        }
+                                    )
+
+                                    if requester_slack_id:
+                                        action_payload = json.dumps(
+                                            {
+                                                "page_id": notion_page_id,
+                                                "stage": "承認済",
+                                                "requester_slack_id": requester_slack_id,
+                                            }
+                                        )
+
+                                action_elements: List[Dict[str, Any]] = []
+                                if notion_url:
+                                    action_elements.append(
+                                        {
+                                            "type": "button",
+                                            "action_id": "open_notion_page",
+                                            "text": {"type": "plain_text", "text": "📝 Notionを開く", "emoji": True},
+                                            "url": notion_url,
+                                        }
+                                    )
+
+                                if action_payload:
+                                    action_elements.append(
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "✅ 完了報告", "emoji": True},
+                                            "style": "primary",
+                                            "action_id": "open_completion_modal",
+                                            "value": action_payload,
+                                        }
+                                    )
+                                    action_elements.append(
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "⏳ 延期申請", "emoji": True},
+                                            "action_id": "open_extension_modal",
+                                            "value": action_payload,
+                                        }
+                                    )
+
+                                if action_elements:
+                                    blocks.append(
+                                        {
+                                            "type": "actions",
+                                            "elements": action_elements,
+                                        }
+                                    )
+
+                                if action_payload:
+                                    blocks.append(
+                                        {
+                                            "type": "context",
+                                            "elements": [
+                                                {
+                                                    "type": "mrkdwn",
+                                                    "text": "完了報告は依頼者に送信されます。延期申請は依頼者による承認後に反映されます。",
+                                                }
+                                            ],
+                                        }
+                                    )
+
                                 slack_service.client.chat_update(
                                     channel=channel,
                                     ts=message_ts,
                                     text="✅ タスクを承認しました",
-                                    blocks=[
-                                        {
-                                            "type": "section",
-                                            "text": {
-                                                "type": "mrkdwn",
-                                                "text": f"✅ このタスクは承認され、Notionに登録されました{calendar_status}"
-                                            }
-                                        }
-                                    ]
+                                    blocks=blocks,
                                 )
                             except Exception as update_error:
                                 print(f"⚠️ メッセージ更新エラー: {update_error}")
@@ -879,7 +985,11 @@ async def handle_interactive(request: Request):
 
             asyncio.create_task(run_extension_rejection())
             return JSONResponse(content={})
-        
+
+        elif action_id == "open_notion_page":
+            # URLボタンはクライアント側で開かれるためACKのみ返す
+            return JSONResponse(content={})
+
         elif action_id == "ai_enhance_button":
             # AI補完ボタンの処理: まず即時ACKし、その後非同期で更新
             print(f"🤖 AI補完ボタン押下: user_id={user_id}, action_id={action_id}")
@@ -1185,7 +1295,7 @@ async def handle_interactive(request: Request):
                     }
                 )
 
-            reason = values.get("reason_block", {}).get("reason_input", {}).get("value", "").strip()
+            reason = _get_text_input_value(values, "reason_block", "reason_input")
             if not reason:
                 return JSONResponse(
                     content={
@@ -1260,7 +1370,7 @@ async def handle_interactive(request: Request):
             private_metadata = json.loads(view.get("private_metadata", "{}"))
             require_reason = private_metadata.get("require_reason", False)
 
-            note = values.get("note_block", {}).get("note_input", {}).get("value", "").strip()
+            note = _get_text_input_value(values, "note_block", "note_input")
 
             if require_reason and not note:
                 return JSONResponse(
@@ -1395,7 +1505,7 @@ async def handle_interactive(request: Request):
             private_metadata = json.loads(view.get("private_metadata", "{}"))
 
             new_due_ts = values.get("new_due_block", {}).get("new_due_picker", {}).get("selected_date_time")
-            reason = values.get("reason_block", {}).get("reason_input", {}).get("value", "").strip()
+            reason = _get_text_input_value(values, "reason_block", "reason_input")
 
             if not new_due_ts:
                 return JSONResponse(
@@ -1585,6 +1695,19 @@ def _format_datetime_text(value: Optional[datetime]) -> str:
     else:
         localized = value.replace(tzinfo=JST)
     return localized.strftime("%Y-%m-%d %H:%M")
+
+
+def _get_text_input_value(values: Dict[str, Any], block_id: str, action_id: str) -> str:
+    block_state = values.get(block_id)
+    if not isinstance(block_state, dict):
+        return ""
+    action_state = block_state.get(action_id)
+    if not isinstance(action_state, dict):
+        return ""
+    value = action_state.get("value")
+    if isinstance(value, str):
+        return value.strip()
+    return ""
 
 
 def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
