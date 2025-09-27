@@ -11,10 +11,12 @@ from src.infrastructure.notion.dynamic_notion_service import (
     REMINDER_STAGE_BEFORE,
     REMINDER_STAGE_DUE,
     REMINDER_STAGE_OVERDUE,
-    EXTENSION_STATUS_APPROVED,
+    REMINDER_STAGE_PENDING_APPROVAL,
     EXTENSION_STATUS_PENDING,
     COMPLETION_STATUS_REQUESTED,
     COMPLETION_STATUS_APPROVED,
+    TASK_STATUS_PENDING,
+    TASK_STATUS_APPROVED,
 )
 from src.infrastructure.repositories.notion_user_repository_impl import NotionUserRepositoryImpl
 from src.infrastructure.repositories.slack_user_repository_impl import SlackUserRepositoryImpl
@@ -175,43 +177,19 @@ async def run_reminders():
         email_cache[email] = None
         return None
 
-    def determine_stage(snapshot) -> Optional[str]:
-        if snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
-            return None
-        due = snapshot.due_date
-        if not due:
-            return None
-        due_value = due.astimezone(timezone.utc) if due.tzinfo else due.replace(tzinfo=timezone.utc)
-        now_value = now
-        due_date_only = due_value.date()
-        today = now_value.date()
-
-        if snapshot.extension_status == EXTENSION_STATUS_PENDING:
-            return None
-
-        if due_date_only > today:
-            hours_until_due = (due_value - now_value).total_seconds() / 3600
-            if hours_until_due <= 24:
-                return REMINDER_STAGE_BEFORE
-            return None
-        if due_date_only == today:
-            if (due_value - now_value).total_seconds() >= 0:
-                return REMINDER_STAGE_DUE
-            return REMINDER_STAGE_OVERDUE
-        return REMINDER_STAGE_OVERDUE
-
     for snapshot in snapshots:
         try:
-            stage = determine_stage(snapshot)
+            stage = determine_reminder_stage(snapshot, now)
 
             if stage is None:
-                if snapshot.overdue_points and snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
+                if snapshot.overdue_points and _should_clear_overdue_points(snapshot, now):
                     await notion_service.set_overdue_points(snapshot.page_id, 0)
                     snapshot.overdue_points = 0
-                elif snapshot.overdue_points and snapshot.completion_status != COMPLETION_STATUS_APPROVED:
-                    # leave as-is to reflect outstanding overdue
-                    pass
                 continue
+
+            if stage == REMINDER_STAGE_PENDING_APPROVAL and snapshot.overdue_points:
+                await notion_service.set_overdue_points(snapshot.page_id, 0)
+                snapshot.overdue_points = 0
 
             if stage == snapshot.reminder_stage:
                 continue
@@ -232,12 +210,13 @@ async def run_reminders():
                     snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}
                     and requested_before_due
                 )
-                target_points = 0 if (snapshot.extension_status == EXTENSION_STATUS_APPROVED or completion_safe) else 1
+                eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
+                target_points = 1 if (eligible_for_overdue_points and not completion_safe) else 0
                 if snapshot.overdue_points != target_points:
                     await notion_service.set_overdue_points(snapshot.page_id, target_points)
                     snapshot.overdue_points = target_points
             else:
-                if snapshot.overdue_points:
+                if snapshot.overdue_points and _should_clear_overdue_points(snapshot, now):
                     await notion_service.set_overdue_points(snapshot.page_id, 0)
                     snapshot.overdue_points = 0
 
@@ -838,8 +817,14 @@ async def handle_interactive(request: Request):
                         snapshot.completion_requested_at if snapshot else None,
                         snapshot.due_date if snapshot else None,
                     )
+                    eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
 
-                    await notion_service.approve_completion(page_id, approval_time, requested_before_due)
+                    await notion_service.approve_completion(
+                        page_id,
+                        approval_time,
+                        requested_before_due,
+                        eligible_for_overdue_points,
+                    )
                     await notion_service.update_task_status(page_id, "completed")
 
                     user_info = await slack_service.get_user_info(user_id)
@@ -1639,12 +1624,14 @@ async def handle_interactive(request: Request):
                         raise ValueError("依頼者のSlackアカウントが見つかりません")
 
                     requested_before_due = _requested_on_time(requested_at, snapshot.due_date)
+                    eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
 
                     await notion_service.request_completion(
                         page_id=page_id,
                         request_time=requested_at,
                         note=note,
                         requested_before_due=requested_before_due,
+                        eligible_for_overdue_point=eligible_for_overdue_points,
                     )
 
                     await notion_service.record_audit_log(
@@ -1943,6 +1930,65 @@ def _requested_on_time(requested_at: Optional[datetime], due: Optional[datetime]
     if not req_utc or not due_utc:
         return False
     return req_utc <= due_utc
+
+
+def determine_reminder_stage(snapshot, reference_time: datetime) -> Optional[str]:
+    """リマインド対象ステージを判定"""
+    task_status = getattr(snapshot, "status", None)
+    if task_status == TASK_STATUS_PENDING:
+        return REMINDER_STAGE_PENDING_APPROVAL
+
+    if snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
+        return None
+
+    due = getattr(snapshot, "due_date", None)
+    if not due:
+        return None
+
+    due_value = due.astimezone(timezone.utc) if due.tzinfo else due.replace(tzinfo=timezone.utc)
+    now_value = reference_time
+
+    if snapshot.extension_status == EXTENSION_STATUS_PENDING:
+        return None
+
+    due_date_only = due_value.date()
+    today = now_value.date()
+
+    if due_date_only > today:
+        hours_until_due = (due_value - now_value).total_seconds() / 3600
+        if hours_until_due <= 24:
+            return REMINDER_STAGE_BEFORE
+        return None
+
+    if due_date_only == today:
+        if (due_value - now_value).total_seconds() >= 0:
+            return REMINDER_STAGE_DUE
+        return REMINDER_STAGE_OVERDUE
+
+    return REMINDER_STAGE_OVERDUE
+
+
+def _should_clear_overdue_points(snapshot, reference_time: datetime) -> bool:
+    """納期超過ポイントをクリアすべきかどうか判定"""
+    due = getattr(snapshot, "due_date", None)
+    due_utc = _to_utc(due)
+    now_utc = _to_utc(reference_time)
+
+    # 納期が存在せず、あるいは未来に再設定された場合はクリア
+    if not due_utc or (now_utc and due_utc > now_utc):
+        return True
+
+    # タスクが承認待ちのままならポイントは付与しない
+    if getattr(snapshot, "status", None) == TASK_STATUS_PENDING:
+        return True
+
+    completion_status = getattr(snapshot, "completion_status", None)
+    if completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
+        requested_at = getattr(snapshot, "completion_requested_at", None)
+        if _requested_on_time(requested_at, due):
+            return True
+
+    return False
 
 
 def _extract_plain_text_from_rich_text(rich_text: Dict[str, Any]) -> str:

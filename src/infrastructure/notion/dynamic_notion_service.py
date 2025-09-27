@@ -16,6 +16,7 @@ REMINDER_STAGE_BEFORE = "期日前"
 REMINDER_STAGE_DUE = "当日"
 REMINDER_STAGE_OVERDUE = "超過"
 REMINDER_STAGE_ACKED = "既読"
+REMINDER_STAGE_PENDING_APPROVAL = "未承認"
 
 EXTENSION_STATUS_NONE = "なし"
 EXTENSION_STATUS_PENDING = "申請中"
@@ -27,7 +28,17 @@ COMPLETION_STATUS_REQUESTED = "完了申請中"
 COMPLETION_STATUS_APPROVED = "完了承認"
 COMPLETION_STATUS_REJECTED = "完了却下"
 
-EXCLUDED_STATUSES_FOR_REMINDER = {"差し戻し", "完了", "無効"}
+TASK_STATUS_PENDING = "承認待ち"
+TASK_STATUS_APPROVED = "承認済み"
+TASK_STATUS_REJECTED = "差し戻し"
+TASK_STATUS_COMPLETED = "完了"
+TASK_STATUS_DISABLED = "無効"
+
+EXCLUDED_STATUSES_FOR_REMINDER = {
+    TASK_STATUS_REJECTED,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_DISABLED,
+}
 
 TASK_PROP_TITLE = "タイトル"
 TASK_PROP_DUE = "納期"
@@ -663,13 +674,13 @@ class DynamicNotionService:
     def _get_status_name(self, status: str) -> str:
         """ステータスの表示名を取得"""
         status_map = {
-            "pending": "承認待ち",
-            "approved": "承認済み",
-            "rejected": "差し戻し",
-            "completed": "完了",
-            "disabled": "無効",
+            "pending": TASK_STATUS_PENDING,
+            "approved": TASK_STATUS_APPROVED,
+            "rejected": TASK_STATUS_REJECTED,
+            "completed": TASK_STATUS_COMPLETED,
+            "disabled": TASK_STATUS_DISABLED,
         }
-        return status_map.get(status, "承認待ち")
+        return status_map.get(status, TASK_STATUS_PENDING)
 
     async def get_task_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
         """タスクIDでNotionページを取得
@@ -1040,6 +1051,7 @@ class DynamicNotionService:
         request_time: datetime,
         note: Optional[str],
         requested_before_due: bool,
+        eligible_for_overdue_point: bool,
     ) -> None:
         properties = {
             TASK_PROP_COMPLETION_STATUS: {
@@ -1077,10 +1089,10 @@ class DynamicNotionService:
         else:
             properties[TASK_PROP_COMPLETION_NOTE] = {"rich_text": []}
 
-        if requested_before_due:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
-        else:
+        if eligible_for_overdue_point and not requested_before_due:
             properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
+        else:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
 
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
@@ -1092,6 +1104,7 @@ class DynamicNotionService:
         page_id: str,
         approval_time: datetime,
         requested_before_due: bool,
+        eligible_for_overdue_point: bool,
     ) -> None:
         properties = {
             TASK_PROP_COMPLETION_STATUS: {
@@ -1108,10 +1121,10 @@ class DynamicNotionService:
             },
         }
 
-        if requested_before_due:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
-        else:
+        if eligible_for_overdue_point and not requested_before_due:
             properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
+        else:
+            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
 
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
