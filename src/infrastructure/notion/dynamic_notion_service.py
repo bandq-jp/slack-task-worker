@@ -52,7 +52,6 @@ TASK_PROP_LAST_READ_AT = "最終既読日時"
 TASK_PROP_EXTENSION_STATUS = "延期ステータス"
 TASK_PROP_EXTENSION_DUE = "延期期日（申請中）"
 TASK_PROP_EXTENSION_REASON = "延期理由（申請中）"
-TASK_PROP_OVERDUE_POINTS = "納期超過ポイント"
 
 TASK_PROP_COMPLETION_STATUS = "完了ステータス"
 TASK_PROP_COMPLETION_REQUESTED_AT = "完了申請日時"
@@ -85,7 +84,6 @@ class NotionTaskSnapshot:
     extension_status: Optional[str]
     extension_requested_due: Optional[datetime]
     extension_reason: Optional[str]
-    overdue_points: int
     completion_status: Optional[str]
     completion_requested_at: Optional[datetime]
     completion_note: Optional[str]
@@ -476,9 +474,6 @@ class DynamicNotionService:
                 },
                 TASK_PROP_REMINDER_READ: {
                     "checkbox": False,
-                },
-                TASK_PROP_OVERDUE_POINTS: {
-                    "number": 0,
                 },
                 TASK_PROP_EXTENSION_STATUS: {
                     "select": {"name": EXTENSION_STATUS_NONE},
@@ -999,9 +994,6 @@ class DynamicNotionService:
             TASK_PROP_LAST_READ_AT: {
                 "date": None,
             },
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": 0,
-            },
             TASK_PROP_COMPLETION_STATUS: {
                 "select": {"name": COMPLETION_STATUS_IN_PROGRESS},
             },
@@ -1033,25 +1025,12 @@ class DynamicNotionService:
         except Exception as exc:
             print(f"⚠️ Failed to reject extension: {exc}")
 
-    async def set_overdue_points(self, page_id: str, points: int) -> None:
-        properties = {
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": points,
-            }
-        }
-
-        try:
-            self.client.pages.update(page_id=page_id, properties=properties)
-        except Exception as exc:
-            print(f"⚠️ Failed to update overdue points: {exc}")
-
     async def request_completion(
         self,
         page_id: str,
         request_time: datetime,
         note: Optional[str],
         requested_before_due: bool,
-        eligible_for_overdue_point: bool,
     ) -> None:
         properties = {
             TASK_PROP_COMPLETION_STATUS: {
@@ -1089,11 +1068,6 @@ class DynamicNotionService:
         else:
             properties[TASK_PROP_COMPLETION_NOTE] = {"rich_text": []}
 
-        if eligible_for_overdue_point and not requested_before_due:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
-        else:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
-
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
         except Exception as exc:
@@ -1104,7 +1078,6 @@ class DynamicNotionService:
         page_id: str,
         approval_time: datetime,
         requested_before_due: bool,
-        eligible_for_overdue_point: bool,
     ) -> None:
         properties = {
             TASK_PROP_COMPLETION_STATUS: {
@@ -1120,11 +1093,6 @@ class DynamicNotionService:
                 "checkbox": True,
             },
         }
-
-        if eligible_for_overdue_point and not requested_before_due:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
-        else:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
 
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
@@ -1172,9 +1140,6 @@ class DynamicNotionService:
             },
             TASK_PROP_LAST_READ_AT: {
                 "date": None,
-            },
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": 0,
             },
         }
 
@@ -1231,9 +1196,6 @@ class DynamicNotionService:
         extension_reason_prop = properties.get(TASK_PROP_EXTENSION_REASON)
         extension_reason = self._extract_rich_text(extension_reason_prop)
 
-        overdue_points_prop = properties.get(TASK_PROP_OVERDUE_POINTS, {})
-        overdue_points = int(overdue_points_prop.get("number")) if overdue_points_prop.get("number") is not None else 0
-
         completion_status_prop = properties.get(TASK_PROP_COMPLETION_STATUS, {})
         completion_status = None
         if completion_status_prop.get("select"):
@@ -1267,7 +1229,6 @@ class DynamicNotionService:
             extension_status=extension_status,
             extension_requested_due=extension_requested_due,
             extension_reason=extension_reason,
-            overdue_points=overdue_points,
             completion_status=completion_status,
             completion_requested_at=completion_requested_at,
             completion_note=completion_note,
@@ -1372,9 +1333,6 @@ class DynamicNotionService:
             },
             TASK_PROP_EXTENSION_REASON: {
                 "rich_text": [],
-            },
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": 0,
             },
             TASK_PROP_COMPLETION_STATUS: {
                 "select": {"name": COMPLETION_STATUS_IN_PROGRESS},

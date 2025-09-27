@@ -362,15 +362,11 @@ class SlackService:
             due_text = self._format_datetime(snapshot.due_date) if getattr(snapshot, "due_date", None) else "未設定"
             notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
             extension_status = getattr(snapshot, "extension_status", None)
-            overdue_points = getattr(snapshot, "overdue_points", 0)
-
             info_lines = [f"*ステータス:* {getattr(snapshot, 'status', '未取得')}"]
             if stage == REMINDER_STAGE_PENDING_APPROVAL:
                 info_lines.append("*承認待ち:* 先にタスクを承認してください。承認後に納期リマインドが開始されます。")
             if extension_status and extension_status != "なし":
                 info_lines.append(f"*延期ステータス:* {extension_status}")
-            if overdue_points and stage != REMINDER_STAGE_PENDING_APPROVAL:
-                info_lines.append(f"*納期超過ポイント:* {overdue_points}")
 
             blocks: List[Dict[str, Any]] = [
                 {

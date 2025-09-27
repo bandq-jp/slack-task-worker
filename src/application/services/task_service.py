@@ -9,6 +9,7 @@ from src.application.dto.task_dto import (
     TaskResponseDto,
     ReviseTaskRequestDto,
 )
+from src.application.services.task_metrics_service import TaskMetricsApplicationService
 
 
 class TaskApplicationService:
@@ -20,11 +21,13 @@ class TaskApplicationService:
         user_repository: UserRepositoryInterface,
         slack_service,  # SlackServiceインターフェース
         notion_service,  # NotionServiceインターフェース
+        task_metrics_service: Optional[TaskMetricsApplicationService] = None,
     ):
         self.task_repository = task_repository
         self.user_repository = user_repository
         self.slack_service = slack_service
         self.notion_service = notion_service
+        self.task_metrics_service = task_metrics_service
 
     async def create_task_request(self, dto: CreateTaskRequestDto) -> TaskResponseDto:
         """タスク依頼を作成"""
@@ -77,6 +80,8 @@ class TaskApplicationService:
             task=saved_task,
             requester_name=requester.get("real_name", "Unknown"),
         )
+
+        await self._sync_metrics(task.notion_page_id)
 
         return self._to_response_dto(saved_task)
 
@@ -137,6 +142,8 @@ class TaskApplicationService:
             actor_email=requester_email,
         )
 
+        await self._sync_metrics(task.notion_page_id)
+
         return self._to_response_dto(updated_task)
 
     async def handle_task_approval(self, dto: TaskApprovalDto) -> TaskResponseDto:
@@ -188,7 +195,18 @@ class TaskApplicationService:
         # タスクを更新
         updated_task = await self.task_repository.update(task)
 
+        await self._sync_metrics(task.notion_page_id)
+
         return self._to_response_dto(updated_task)
+
+    async def _sync_metrics(self, notion_page_id: Optional[str]) -> None:
+        if not notion_page_id or not self.task_metrics_service:
+            return
+
+        snapshot = await self.notion_service.get_task_snapshot(notion_page_id)
+        if snapshot:
+            await self.task_metrics_service.sync_snapshot(snapshot)
+            await self.task_metrics_service.refresh_assignee_summaries()
 
     def _to_response_dto(self, task: TaskRequest) -> TaskResponseDto:
         """タスクエンティティをレスポンスDTOに変換"""

@@ -6,6 +6,8 @@ from typing import Dict, Any, Optional, List
 from src.application.services.task_service import TaskApplicationService
 from src.application.dto.task_dto import CreateTaskRequestDto, TaskApprovalDto, ReviseTaskRequestDto
 from src.infrastructure.slack.slack_service import SlackService, REMINDER_STAGE_LABELS
+from src.infrastructure.notion.admin_metrics_service import AdminMetricsNotionService
+from src.application.services.task_metrics_service import TaskMetricsApplicationService
 from src.infrastructure.notion.dynamic_notion_service import (
     DynamicNotionService,
     REMINDER_STAGE_BEFORE,
@@ -42,6 +44,8 @@ class Settings(BaseSettings):
     notion_database_id: str = ""
     notion_audit_database_id: str = ""
     mapping_database_id: str = ""
+    notion_metrics_database_id: str = ""
+    notion_assignee_summary_database_id: str = ""
     gcs_bucket_name: str = ""
     google_application_credentials: str = ""
     service_account_json: str = ""
@@ -82,6 +86,10 @@ print("🚀 Slack-Notion Task Management System initialized!")
 print(f"🌍 Environment: {settings.env}")
 print(f"📋 Slack Command: {settings.slack_command_name}{settings.app_name_suffix}")
 print(f"📊 Notion Database: {settings.notion_database_id}")
+if settings.notion_metrics_database_id:
+    print(f"📈 Metrics Database: {settings.notion_metrics_database_id}")
+if settings.notion_assignee_summary_database_id:
+    print(f"👤 Summary Database: {settings.notion_assignee_summary_database_id}")
 print("🔄 Using dynamic user search (no mapping files)")
 
 # リポジトリとサービスのインスタンス化（DDD版DI）
@@ -109,6 +117,12 @@ notion_service = DynamicNotionService(
     user_mapping_service=user_mapping_service,
     audit_database_id=settings.notion_audit_database_id,
 )
+admin_metrics_service = AdminMetricsNotionService(
+    notion_token=settings.notion_token,
+    metrics_database_id=settings.notion_metrics_database_id,
+    summary_database_id=settings.notion_assignee_summary_database_id,
+)
+task_metrics_service = TaskMetricsApplicationService(admin_metrics_service=admin_metrics_service)
 ai_service = (
     TaskAIService(
         settings.gemini_api_key,
@@ -125,6 +139,7 @@ task_service = TaskApplicationService(
     user_repository=user_repository,
     slack_service=slack_service,
     notion_service=notion_service,
+    task_metrics_service=task_metrics_service,
 )
 
 # Google Calendar サービスの初期化（オプショナル）
@@ -160,6 +175,8 @@ async def run_reminders():
     notifications: List[Dict[str, Any]] = []
     errors: List[str] = []
 
+    metrics_cache = await task_metrics_service.ensure_metrics_for_snapshots(snapshots)
+
     async def resolve_slack_id(email: Optional[str]) -> Optional[str]:
         if not email:
             return None
@@ -181,17 +198,23 @@ async def run_reminders():
         try:
             stage = determine_reminder_stage(snapshot, now)
 
+            metrics = metrics_cache.get(snapshot.page_id)
+
             if stage is None:
-                if snapshot.overdue_points and _should_clear_overdue_points(snapshot, now):
-                    await notion_service.set_overdue_points(snapshot.page_id, 0)
-                    snapshot.overdue_points = 0
+                if metrics and metrics.overdue_points and _should_clear_overdue_points(snapshot, now):
+                    updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, 0)
+                    if updated_metrics:
+                        metrics_cache[snapshot.page_id] = updated_metrics
                 continue
 
-            if stage == REMINDER_STAGE_PENDING_APPROVAL and snapshot.overdue_points:
-                await notion_service.set_overdue_points(snapshot.page_id, 0)
-                snapshot.overdue_points = 0
+            if stage == REMINDER_STAGE_PENDING_APPROVAL and metrics and metrics.overdue_points:
+                updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, 0)
+                if updated_metrics:
+                    metrics_cache[snapshot.page_id] = updated_metrics
+                    metrics = updated_metrics
 
             if stage == snapshot.reminder_stage:
+                await task_metrics_service.update_reminder_stage(snapshot.page_id, stage, now)
                 continue
 
             assignee_slack_id = await resolve_slack_id(snapshot.assignee_email)
@@ -212,13 +235,19 @@ async def run_reminders():
                 )
                 eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
                 target_points = 1 if (eligible_for_overdue_points and not completion_safe) else 0
-                if snapshot.overdue_points != target_points:
-                    await notion_service.set_overdue_points(snapshot.page_id, target_points)
-                    snapshot.overdue_points = target_points
+                current_points = metrics.overdue_points if metrics else 0
+                if current_points != target_points:
+                    updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, target_points)
+                    if updated_metrics:
+                        metrics_cache[snapshot.page_id] = updated_metrics
+                        metrics = updated_metrics
             else:
-                if snapshot.overdue_points and _should_clear_overdue_points(snapshot, now):
-                    await notion_service.set_overdue_points(snapshot.page_id, 0)
-                    snapshot.overdue_points = 0
+                current_points = metrics.overdue_points if metrics else 0
+                if current_points and _should_clear_overdue_points(snapshot, now):
+                    updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, 0)
+                    if updated_metrics:
+                        metrics_cache[snapshot.page_id] = updated_metrics
+                        metrics = updated_metrics
 
             await slack_service.send_task_reminder(
                 assignee_slack_id=assignee_slack_id,
@@ -228,6 +257,8 @@ async def run_reminders():
             )
 
             await notion_service.update_reminder_state(snapshot.page_id, stage, now)
+            await task_metrics_service.update_reminder_stage(snapshot.page_id, stage, now)
+            snapshot.reminder_stage = stage
 
             detail = f"{REMINDER_STAGE_LABELS.get(stage, stage)}\n納期: {_format_datetime_text(snapshot.due_date)}"
             event_type = "期限超過" if stage == REMINDER_STAGE_OVERDUE else "リマインド送信"
@@ -249,6 +280,8 @@ async def run_reminders():
         except Exception as reminder_error:
             print(f"⚠️ Reminder processing failed for task {getattr(snapshot, 'page_id', 'unknown')}: {reminder_error}")
             errors.append(f"reminder_error:{getattr(snapshot, 'page_id', 'unknown')}")
+
+    await task_metrics_service.refresh_assignee_summaries()
 
     return {
         "timestamp": now.isoformat(),
@@ -823,7 +856,6 @@ async def handle_interactive(request: Request):
                         page_id,
                         approval_time,
                         requested_before_due,
-                        eligible_for_overdue_points,
                     )
                     await notion_service.update_task_status(page_id, "completed")
 
@@ -857,6 +889,15 @@ async def handle_interactive(request: Request):
                         snapshot=snapshot,
                         approval_time=approval_time,
                     )
+
+                    target_points = 1 if (eligible_for_overdue_points and not requested_before_due) else 0
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        overdue_points=target_points,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
 
                 except Exception as approval_error:
                     print(f"⚠️ Completion approval failed: {approval_error}")
@@ -962,6 +1003,14 @@ async def handle_interactive(request: Request):
                         new_due=approved_due,
                     )
 
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        reminder_stage=snapshot_for_metrics.reminder_stage,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
+
                 except Exception as approval_error:
                     print(f"⚠️ Extension approval failed: {approval_error}")
 
@@ -1020,6 +1069,14 @@ async def handle_interactive(request: Request):
                         requester_slack_id=requester_slack_id,
                         snapshot=snapshot,
                     )
+
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        reminder_stage=snapshot_for_metrics.reminder_stage,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
 
                 except Exception as rejection_error:
                     print(f"⚠️ Extension rejection failed: {rejection_error}")
@@ -1631,8 +1688,16 @@ async def handle_interactive(request: Request):
                         request_time=requested_at,
                         note=note,
                         requested_before_due=requested_before_due,
-                        eligible_for_overdue_point=eligible_for_overdue_points,
                     )
+
+                    target_points = 1 if (eligible_for_overdue_points and not requested_before_due) else 0
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        overdue_points=target_points,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
 
                     await notion_service.record_audit_log(
                         task_page_id=page_id,
