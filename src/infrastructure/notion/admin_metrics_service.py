@@ -50,6 +50,7 @@ class AdminMetricsNotionService:
             if summary_database_id
             else None
         )
+        self._summary_title_prop_name: Optional[str] = None
 
     @staticmethod
     def _normalize_database_id(database_id: str) -> str:
@@ -81,6 +82,7 @@ class AdminMetricsNotionService:
             has_more = response.get("has_more", False)
             start_cursor = response.get("next_cursor")
 
+        print(f"📊 Metrics loaded from Notion: {len(results)} 件")
         return results
 
     async def get_metrics_by_task_id(self, task_page_id: str) -> Optional[TaskMetricsRecord]:
@@ -178,17 +180,54 @@ class AdminMetricsNotionService:
                 print("⚠️ Summary database ID is not configured; skipping summary sync.")
             return
 
+        print(f"🧮 Building assignee summaries: {len(summary_items)} 件")
         for summary in summary_items:
             existing = self._find_summary_by_email(summary.assignee_email)
+            if not existing and summary.assignee_notion_id:
+                existing = self._find_summary_by_person(summary.assignee_notion_id)
             properties = self._build_summary_properties(summary)
 
             if existing and existing.get("id"):
-                self.client.pages.update(page_id=existing["id"], properties=properties)
+                try:
+                    self.client.pages.update(page_id=existing["id"], properties=properties)
+                    print(f"🔁 Updated summary for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}")
+                except Exception as e:
+                    print(f"❌ Failed to update summary: {e}")
             else:
-                self.client.pages.create(
-                    parent={"database_id": self.summary_database_id},
-                    properties=properties,
-                )
+                try:
+                    self.client.pages.create(
+                        parent={"database_id": self.summary_database_id},
+                        properties=properties,
+                    )
+                    print(f"✅ Created summary for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}")
+                except Exception as e:
+                    print(f"❌ Failed to create summary: {e}")
+                    # タイトル未設定等の可能性があるため、タイトルプロパティ名を推定して再試行
+                    try:
+                        title_prop = self._get_summary_title_prop_name()
+                        if title_prop and title_prop not in properties:
+                            title_content = (
+                                summary.assignee_name
+                                or summary.assignee_email
+                                or "(unassigned)"
+                            )
+                            properties[title_prop] = {
+                                "title": [
+                                    {
+                                        "type": "text",
+                                        "text": {"content": title_content[:1000]},
+                                    }
+                                ]
+                            }
+                            self.client.pages.create(
+                                parent={"database_id": self.summary_database_id},
+                                properties=properties,
+                            )
+                            print(
+                                f"✅ Retried and created summary with title for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}"
+                            )
+                    except Exception as retry_error:
+                        print(f"❌ Retry failed to create summary: {retry_error}")
 
     def _find_summary_by_email(self, assignee_email: Optional[str]) -> Optional[Dict[str, Any]]:
         if not self.summary_database_id or not assignee_email:
@@ -204,6 +243,24 @@ class AdminMetricsNotionService:
         )
         results = response.get("results", [])
         return results[0] if results else None
+
+    def _find_summary_by_person(self, notion_user_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not self.summary_database_id or not notion_user_id:
+            return None
+        try:
+            response = self.client.databases.query(
+                database_id=self.summary_database_id,
+                page_size=1,
+                filter={
+                    "property": SUMMARY_PROP_ASSIGNEE,
+                    "people": {"contains": notion_user_id},
+                },
+            )
+            results = response.get("results", [])
+            return results[0] if results else None
+        except Exception as e:
+            print(f"⚠️ Failed to find summary by person: {e}")
+            return None
 
     def _build_task_metrics_properties(self, record: TaskMetricsRecord) -> Dict[str, Any]:
         title_content = record.task_title or "(untitled)"
@@ -293,6 +350,16 @@ class AdminMetricsNotionService:
             },
         }
 
+        # タイトルプロパティ（存在すれば設定）
+        title_prop = self._get_summary_title_prop_name()
+        if title_prop:
+            title_content = summary.assignee_name or summary.assignee_email or "(unassigned)"
+            properties[title_prop] = {
+                "title": [
+                    {"type": "text", "text": {"content": title_content[:1000]}}
+                ]
+            }
+
         if summary.assignee_notion_id:
             properties[SUMMARY_PROP_ASSIGNEE] = {
                 "people": [{"object": "user", "id": summary.assignee_notion_id}]
@@ -325,6 +392,25 @@ class AdminMetricsNotionService:
             properties[SUMMARY_PROP_NEXT_DUE] = {"date": None}
 
         return properties
+
+    def _get_summary_title_prop_name(self) -> Optional[str]:
+        """Summary DBのタイトルプロパティ名を取得（キャッシュ）"""
+        if not self.summary_database_id:
+            return None
+        if self._summary_title_prop_name is not None:
+            return self._summary_title_prop_name
+        try:
+            db = self.client.databases.retrieve(database_id=self.summary_database_id)
+            props = db.get("properties", {})
+            for name, meta in props.items():
+                if meta.get("type") == "title":
+                    self._summary_title_prop_name = name
+                    return name
+        except Exception as e:
+            print(f"⚠️ Could not retrieve summary DB schema: {e}")
+        # キャッシュにNoneを記録して以後スキップ
+        self._summary_title_prop_name = None
+        return None
 
     def _to_metrics_record(self, page: Dict[str, Any]) -> Optional[TaskMetricsRecord]:
         properties = page.get("properties", {})

@@ -84,5 +84,7 @@ class TaskMetricsApplicationService:
 
     async def refresh_assignee_summaries(self) -> None:
         metrics = await self.admin_metrics_service.fetch_all_metrics()
+        print(f"📈 Metrics fetched for summary: {len(metrics)} 件")
         summaries = self.domain_service.build_assignee_summaries(metrics, datetime.now(timezone.utc))
+        print(f"🧾 Summaries to upsert: {len(summaries)} 件")
         await self.admin_metrics_service.upsert_assignee_summaries(summaries)
