@@ -940,6 +940,21 @@ async def handle_interactive(request: Request):
                     target_points = 1 if (eligible_for_overdue_points and not requested_before_due) else 0
                     refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
                     snapshot_for_metrics = refreshed_snapshot or snapshot
+
+                    # 延期承認後の納期超過ポイントを即時再判定
+                    try:
+                        now_utc = datetime.now(timezone.utc)
+                        new_due_utc = snapshot_for_metrics.due_date.astimezone(timezone.utc) if snapshot_for_metrics.due_date else None
+                        still_overdue = bool(new_due_utc and new_due_utc <= now_utc)
+                        eligible_status = getattr(snapshot_for_metrics, "status", None) == TASK_STATUS_APPROVED
+                        target_points = 1 if (still_overdue and eligible_status) else 0
+                        # 変更がある場合のみ更新
+                        metrics = await task_metrics_service.admin_metrics_service.get_metrics_by_task_id(page_id)
+                        current_points = metrics.overdue_points if metrics else 0
+                        if current_points != target_points:
+                            await task_metrics_service.update_overdue_points(page_id, target_points)
+                    except Exception as pts_err:
+                        print(f"⚠️ Failed to update overdue points after extension approval: {pts_err}")
                     await task_metrics_service.sync_snapshot(
                         snapshot_for_metrics,
                         overdue_points=target_points,

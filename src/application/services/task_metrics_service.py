@@ -37,6 +37,7 @@ class TaskMetricsApplicationService:
         reminder_stage: Optional[str] = None,
         overdue_points: Optional[int] = None,
     ) -> TaskMetricsRecord:
+        now_utc = datetime.now(timezone.utc)
         record = TaskMetricsRecord(
             task_page_id=snapshot.page_id,
             task_title=snapshot.title,
@@ -65,8 +66,17 @@ class TaskMetricsApplicationService:
             if overdue_points is None:
                 record.overdue_points = existing.overdue_points
         else:
-            record.last_synced_at = datetime.now(timezone.utc)
+            record.last_synced_at = now_utc
             if overdue_points is None:
+                record.overdue_points = 0
+
+        # 延期などで納期が未来になった場合はポイントを必ず0にする（即時リセット）
+        if overdue_points is None:
+            if record.due_date and record.due_date.tzinfo:
+                due_utc = record.due_date.astimezone(timezone.utc)
+            else:
+                due_utc = record.due_date.replace(tzinfo=timezone.utc) if record.due_date else None
+            if due_utc and due_utc > now_utc:
                 record.overdue_points = 0
 
         return await self.admin_metrics_service.upsert_task_metrics(record)
