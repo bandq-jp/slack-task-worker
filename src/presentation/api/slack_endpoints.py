@@ -91,6 +91,10 @@ if settings.notion_metrics_database_id:
 if settings.notion_assignee_summary_database_id:
     print(f"👤 Summary Database: {settings.notion_assignee_summary_database_id}")
 print("🔄 Using dynamic user search (no mapping files)")
+if settings.mapping_database_id:
+    print(f"🔗 Mapping Database: {settings.mapping_database_id} (used for user lookup)")
+else:
+    print("🔗 Mapping Database: (not set) — using main Notion DB for user lookup")
 
 # リポジトリとサービスのインスタンス化（DDD版DI）
 task_repository = InMemoryTaskRepository()
@@ -100,7 +104,8 @@ slack_service = SlackService(settings.slack_token, settings.slack_bot_token, set
 # 新しいDDD実装のサービス初期化
 notion_user_repository = NotionUserRepositoryImpl(
     notion_token=settings.notion_token,
-    default_database_id=settings.notion_database_id
+    default_database_id=settings.notion_database_id,
+    mapping_database_id=settings.mapping_database_id or None,
 )
 slack_user_repository = SlackUserRepositoryImpl(slack_token=settings.slack_bot_token)
 mapping_domain_service = UserMappingDomainService()

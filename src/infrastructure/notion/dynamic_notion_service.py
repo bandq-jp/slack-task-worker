@@ -646,6 +646,14 @@ class DynamicNotionService:
                 print("3. 「Task Request Bot」Integrationを招待")
                 print("4. 「招待」をクリック")
 
+            # 結合データベース（複数ソース）の場合
+            elif "multiple data sources" in str(e).lower():
+                print("\n🔧 データベース種別エラー:")
+                print("指定された NOTION_DATABASE_ID は複数のデータソースを結合したデータベース（リンク/結合ビュー）です。")
+                print("Notion APIではこの種別に対する query/create がサポートされません。")
+                print("- 対応策: 元の単一ソースのタスクDBのIDを NOTION_DATABASE_ID に設定してください。")
+                print("- 参考: データベースのURLから32桁のID（ハイフン除去）を設定します。")
+
             # データベースが見つからない場合
             elif "Could not find database" in str(e):
                 print("\n🔧 データベースIDエラー:")
@@ -799,8 +807,16 @@ class DynamicNotionService:
 
             if start_cursor:
                 query_payload["start_cursor"] = start_cursor
-
-            response = self.client.databases.query(**query_payload)
+            try:
+                response = self.client.databases.query(**query_payload)
+            except Exception as e:
+                if "multiple data sources" in str(e).lower():
+                    print("❌ Notionデータベースは複数ソースの結合DBのため、APIでの検索ができません。")
+                    print("   元の単一ソースDBのIDを NOTION_DATABASE_ID に設定してください。")
+                else:
+                    print(f"❌ Notionデータベース問い合わせエラー: {e}")
+                # 致命的なので以降の処理は打ち切り
+                break
             for page in response.get("results", []):
                 try:
                     snapshot = self._to_snapshot(page)
