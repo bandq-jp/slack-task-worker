@@ -812,13 +812,25 @@ async def handle_interactive(request: Request):
                     print(f"⚠️ Failed to notify user about missing requester Slack ID: {dm_error}")
                 return JSONResponse(content={})
 
-            await slack_service.open_completion_modal(
-                trigger_id=trigger_id,
-                snapshot=snapshot,
-                stage=stage,
-                requester_slack_id=requester_slack_id,
-                assignee_slack_id=user_id,
-            )
+            try:
+                await slack_service.open_completion_modal(
+                    trigger_id=trigger_id,
+                    snapshot=snapshot,
+                    stage=stage,
+                    requester_slack_id=requester_slack_id,
+                    assignee_slack_id=user_id,
+                )
+            except Exception as open_err:
+                print(f"⚠️ Failed to open completion modal: {open_err}")
+                # trigger_idの有効期限切れ等。ユーザーに再試行を促す
+                try:
+                    dm = slack_service.client.conversations_open(users=user_id)
+                    slack_service.client.chat_postMessage(
+                        channel=dm["channel"]["id"],
+                        text="モーダルを開けませんでした（数秒で失効するため）。もう一度ボタンを押してください。",
+                    )
+                except Exception as dm_error:
+                    print(f"⚠️ Failed to DM about modal open failure: {dm_error}")
             return JSONResponse(content={})
 
         elif action_id == "approve_completion_request":

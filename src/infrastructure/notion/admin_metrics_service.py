@@ -189,17 +189,25 @@ class AdminMetricsNotionService:
 
             if existing and existing.get("id"):
                 try:
-                    self.client.pages.update(page_id=existing["id"], properties=properties)
-                    print(f"🔁 Updated summary for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}")
+                    page_id = existing["id"]
+                    self.client.pages.update(page_id=page_id, properties=properties)
+                    print(
+                        f"🔁 Updated summary for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}"
+                        f" | page_id: {page_id}"
+                    )
                 except Exception as e:
                     print(f"❌ Failed to update summary: {e}")
             else:
                 try:
-                    self.client.pages.create(
+                    created = self.client.pages.create(
                         parent={"database_id": self.summary_database_id},
                         properties=properties,
                     )
-                    print(f"✅ Created summary for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}")
+                    page_id = created.get("id")
+                    print(
+                        f"✅ Created summary for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}"
+                        f" | page_id: {page_id}"
+                    )
                 except Exception as e:
                     print(f"❌ Failed to create summary: {e}")
                     # タイトル未設定等の可能性があるため、タイトルプロパティ名を推定して再試行
@@ -219,12 +227,13 @@ class AdminMetricsNotionService:
                                     }
                                 ]
                             }
-                            self.client.pages.create(
+                            created2 = self.client.pages.create(
                                 parent={"database_id": self.summary_database_id},
                                 properties=properties,
                             )
                             print(
                                 f"✅ Retried and created summary with title for: {summary.assignee_email or summary.assignee_notion_id or '(unassigned)'}"
+                                f" | page_id: {created2.get('id')}"
                             )
                     except Exception as retry_error:
                         print(f"❌ Retry failed to create summary: {retry_error}")
