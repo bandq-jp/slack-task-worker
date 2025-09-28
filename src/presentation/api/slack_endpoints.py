@@ -218,7 +218,37 @@ async def run_reminders():
                     metrics_cache[snapshot.page_id] = updated_metrics
                     metrics = updated_metrics
 
-            if stage == snapshot.reminder_stage:
+            # 通知の要否を判定
+            should_notify = False
+            if stage == REMINDER_STAGE_BEFORE:
+                # 期日前は一度だけ通知（従来通り）
+                should_notify = stage != snapshot.reminder_stage
+            elif stage == REMINDER_STAGE_DUE:
+                # 当日は既読になるまで毎回通知
+                due_read = getattr(snapshot, "due_stage_read", False)
+                has_due_prop = getattr(snapshot, "has_due_read_prop", False)
+                if has_due_prop:
+                    should_notify = not due_read
+                else:
+                    # 後方互換: 従来の既読フラグで制御（押されるまで送る）
+                    should_notify = not getattr(snapshot, "reminder_read", False)
+            elif stage == REMINDER_STAGE_OVERDUE:
+                # 超過は必ず一度は通知し、その後は既読で止める
+                overdue_read = getattr(snapshot, "overdue_stage_read", False)
+                has_overdue_prop = getattr(snapshot, "has_overdue_read_prop", False)
+                if has_overdue_prop:
+                    should_notify = not overdue_read
+                else:
+                    # 後方互換: ステージが超過に変わったら少なくとも一度は送る。以後は従来の既読で止める。
+                    if snapshot.reminder_stage != REMINDER_STAGE_OVERDUE:
+                        should_notify = True
+                    else:
+                        should_notify = not getattr(snapshot, "reminder_read", False)
+            else:
+                # その他はステージ変化時のみ
+                should_notify = stage != snapshot.reminder_stage
+
+            if not should_notify:
                 await task_metrics_service.update_reminder_stage(snapshot.page_id, stage, now)
                 continue
 

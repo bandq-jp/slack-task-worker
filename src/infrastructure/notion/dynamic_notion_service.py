@@ -49,6 +49,8 @@ TASK_PROP_REMINDER_STAGE = "リマインドフェーズ"
 TASK_PROP_REMINDER_READ = "リマインド既読"
 TASK_PROP_LAST_REMIND_AT = "最終リマインド日時"
 TASK_PROP_LAST_READ_AT = "最終既読日時"
+TASK_PROP_DUE_READ = "当日既読"
+TASK_PROP_OVERDUE_READ = "超過既読"
 TASK_PROP_EXTENSION_STATUS = "延期ステータス"
 TASK_PROP_EXTENSION_DUE = "延期期日（申請中）"
 TASK_PROP_EXTENSION_REASON = "延期理由（申請中）"
@@ -81,6 +83,10 @@ class NotionTaskSnapshot:
     reminder_last_sent_at: Optional[datetime]
     reminder_read: bool
     reminder_read_at: Optional[datetime]
+    due_stage_read: bool
+    overdue_stage_read: bool
+    has_due_read_prop: bool
+    has_overdue_read_prop: bool
     extension_status: Optional[str]
     extension_requested_due: Optional[datetime]
     extension_reason: Optional[str]
@@ -909,18 +915,9 @@ class DynamicNotionService:
         reminder_time: datetime,
     ) -> None:
         properties = {
-            TASK_PROP_REMINDER_STAGE: {
-                "select": {"name": stage},
-            },
-            TASK_PROP_REMINDER_READ: {
-                "checkbox": False,
-            },
-            TASK_PROP_LAST_REMIND_AT: {
-                "date": {"start": self._format_datetime(reminder_time)},
-            },
-            TASK_PROP_LAST_READ_AT: {
-                "date": None,
-            },
+            TASK_PROP_REMINDER_STAGE: {"select": {"name": stage}},
+            TASK_PROP_REMINDER_READ: {"checkbox": False},
+            TASK_PROP_LAST_REMIND_AT: {"date": {"start": self._format_datetime(reminder_time)}},
         }
 
         try:
@@ -934,23 +931,34 @@ class DynamicNotionService:
         read_time: datetime,
         stage: Optional[str] = None,
     ) -> None:
-        selected_stage = stage or REMINDER_STAGE_ACKED
-        properties = {
-            TASK_PROP_REMINDER_STAGE: {
-                "select": {"name": selected_stage},
-            },
-            TASK_PROP_REMINDER_READ: {
-                "checkbox": True,
-            },
-            TASK_PROP_LAST_READ_AT: {
-                "date": {"start": self._format_datetime(read_time)},
-            },
+        properties: Dict[str, Any] = {
+            TASK_PROP_LAST_READ_AT: {"date": {"start": self._format_datetime(read_time)}}
         }
+
+        # ステージ別の既読フラグを優先的に使用（存在しない場合でもAPIは無視するため安全）
+        if stage == REMINDER_STAGE_DUE:
+            properties[TASK_PROP_DUE_READ] = {"checkbox": True}
+        elif stage == REMINDER_STAGE_OVERDUE:
+            properties[TASK_PROP_OVERDUE_READ] = {"checkbox": True}
+        else:
+            # 後方互換: ステージ不明時は従来の既読フラグを立てる
+            properties[TASK_PROP_REMINDER_READ] = {"checkbox": True}
 
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
         except Exception as exc:
             print(f"⚠️ Failed to mark reminder as read: {exc}")
+            # フォールバック: ステージ別プロパティが存在しない場合は従来の既読フラグ/ステージを使用
+            try:
+                fallback_props: Dict[str, Any] = {
+                    TASK_PROP_REMINDER_STAGE: {"select": {"name": REMINDER_STAGE_ACKED}},
+                    TASK_PROP_REMINDER_READ: {"checkbox": True},
+                    TASK_PROP_LAST_READ_AT: {"date": {"start": self._format_datetime(read_time)}},
+                }
+                self.client.pages.update(page_id=page_id, properties=fallback_props)
+                print("🔁 Fallback: marked as read using legacy properties")
+            except Exception as exc2:
+                print(f"❌ Fallback failed to mark reminder as read: {exc2}")
 
     async def set_extension_request(
         self,
@@ -1201,6 +1209,14 @@ class DynamicNotionService:
         last_read_at_prop = properties.get(TASK_PROP_LAST_READ_AT, {})
         reminder_read_at = self._parse_datetime(last_read_at_prop.get("date"))
 
+        # ステージ別の既読フラグ（存在しなければ False とする）
+        has_due_read_prop = TASK_PROP_DUE_READ in properties
+        due_read_prop = properties.get(TASK_PROP_DUE_READ, {})
+        due_stage_read = bool(due_read_prop.get("checkbox", False))
+        has_overdue_read_prop = TASK_PROP_OVERDUE_READ in properties
+        overdue_read_prop = properties.get(TASK_PROP_OVERDUE_READ, {})
+        overdue_stage_read = bool(overdue_read_prop.get("checkbox", False))
+
         extension_status_prop = properties.get(TASK_PROP_EXTENSION_STATUS, {})
         extension_status = None
         if extension_status_prop.get("select"):
@@ -1242,6 +1258,8 @@ class DynamicNotionService:
             reminder_last_sent_at=last_remind_at,
             reminder_read=reminder_read,
             reminder_read_at=reminder_read_at,
+            due_stage_read=due_stage_read,
+            overdue_stage_read=overdue_stage_read,
             extension_status=extension_status,
             extension_requested_due=extension_requested_due,
             extension_reason=extension_reason,
@@ -1250,6 +1268,8 @@ class DynamicNotionService:
             completion_note=completion_note,
             completion_approved_at=completion_approved_at,
             completion_reject_reason=completion_reject_reason,
+            has_due_read_prop=has_due_read_prop,
+            has_overdue_read_prop=has_overdue_read_prop,
         )
 
     async def update_task_status(
