@@ -28,6 +28,8 @@ class AssigneeMetricsSummary:
     assignee_notion_id: Optional[str]
     assignee_name: Optional[str]
     total_tasks: int
+    open_tasks: int
+    completed_tasks: int
     overdue_tasks: int
     due_within_three_days: int
     next_due_date: Optional[datetime]

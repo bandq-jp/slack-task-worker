@@ -23,6 +23,8 @@ METRICS_PROP_LAST_SYNCED = "最終更新"
 SUMMARY_PROP_ASSIGNEE = "担当者"
 SUMMARY_PROP_ASSIGNEE_EMAIL = "担当者メール"
 SUMMARY_PROP_TOTAL_TASKS = "担当タスク数"
+SUMMARY_PROP_OPEN_TASKS = "未完了タスク数"
+SUMMARY_PROP_COMPLETED_TASKS = "完了タスク数"
 SUMMARY_PROP_OVERDUE_TASKS = "期限超過タスク数"
 SUMMARY_PROP_DUE_SOON_TASKS = "近日納期タスク数"
 SUMMARY_PROP_NEXT_DUE = "最短納期"
@@ -349,6 +351,8 @@ class AdminMetricsNotionService:
     def _build_summary_properties(self, summary: AssigneeMetricsSummary) -> Dict[str, Any]:
         properties: Dict[str, Any] = {
             SUMMARY_PROP_TOTAL_TASKS: {"number": summary.total_tasks},
+            SUMMARY_PROP_OPEN_TASKS: {"number": summary.open_tasks},
+            SUMMARY_PROP_COMPLETED_TASKS: {"number": summary.completed_tasks},
             SUMMARY_PROP_OVERDUE_TASKS: {"number": summary.overdue_tasks},
             SUMMARY_PROP_DUE_SOON_TASKS: {"number": summary.due_within_three_days},
             SUMMARY_PROP_TOTAL_OVERDUE_POINTS: {

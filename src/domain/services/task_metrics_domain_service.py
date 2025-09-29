@@ -47,12 +47,18 @@ class TaskMetricsDomainService:
             due_within_three_days = 0
             next_due_candidate: Optional[datetime] = None
             total_overdue_points = 0
+            completed_count = 0
+            open_count = 0
 
             for record in records:
                 total_overdue_points += max(record.overdue_points, 0)
 
                 due_date = record.due_date
                 completed = self._is_completed(record)
+                if completed:
+                    completed_count += 1
+                else:
+                    open_count += 1
 
                 if due_date:
                     due_date = self._ensure_timezone(due_date)
@@ -71,6 +77,8 @@ class TaskMetricsDomainService:
                     assignee_notion_id=assignee_notion_id,
                     assignee_name=assignee_name,
                     total_tasks=len(records),
+                    open_tasks=open_count,
+                    completed_tasks=completed_count,
                     overdue_tasks=overdue_tasks,
                     due_within_three_days=due_within_three_days,
                     next_due_date=next_due_candidate,
