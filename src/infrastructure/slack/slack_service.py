@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from src.domain.entities.task import TaskRequest
+from src.infrastructure.notion.dynamic_notion_service import REMINDER_STAGE_PENDING_APPROVAL
 from src.utils.text_converter import convert_rich_text_to_plain_text
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,7 @@ REMINDER_STAGE_LABELS = {
     "既読": "✅ 既読済み",
     "未送信": "ℹ️ リマインド準備中",
     "承認済": "✅ 承認済み",
+    "未承認": "📝 承認待ちタスク",
 }
 
 TASK_TYPE_OPTIONS: List[Dict[str, Any]] = [
@@ -360,13 +362,11 @@ class SlackService:
             due_text = self._format_datetime(snapshot.due_date) if getattr(snapshot, "due_date", None) else "未設定"
             notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
             extension_status = getattr(snapshot, "extension_status", None)
-            overdue_points = getattr(snapshot, "overdue_points", 0)
-
             info_lines = [f"*ステータス:* {getattr(snapshot, 'status', '未取得')}"]
+            if stage == REMINDER_STAGE_PENDING_APPROVAL:
+                info_lines.append("*承認待ち:* 先にタスクを承認してください。承認後に納期リマインドが開始されます。")
             if extension_status and extension_status != "なし":
                 info_lines.append(f"*延期ステータス:* {extension_status}")
-            if overdue_points:
-                info_lines.append(f"*納期超過ポイント:* {overdue_points}")
 
             blocks: List[Dict[str, Any]] = [
                 {

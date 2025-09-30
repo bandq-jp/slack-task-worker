@@ -12,9 +12,15 @@ logger = logging.getLogger(__name__)
 class NotionUserRepositoryImpl(NotionUserRepositoryInterface):
     """Notion APIを使用したユーザーリポジトリ実装"""
 
-    def __init__(self, notion_token: str, default_database_id: str):
+    def __init__(self, notion_token: str, default_database_id: str, mapping_database_id: Optional[str] = None):
         self.client = Client(auth=notion_token)
         self.default_database_id = self._normalize_database_id(default_database_id)
+        # ユーザーマッピング専用DB（指定があればこちらを優先）
+        self.mapping_database_id = (
+            self._normalize_database_id(mapping_database_id)
+            if mapping_database_id
+            else None
+        )
 
     def _normalize_database_id(self, database_id: str) -> str:
         """データベースIDを正規化（ハイフンを削除）"""
@@ -25,10 +31,9 @@ class NotionUserRepositoryImpl(NotionUserRepositoryInterface):
         logger.info(f"🔍 ユーザー検索開始: {email}")
 
         # 1. データベースから検索（ゲストユーザー含む）
-        database_users = await self.search_users_in_database(
-            self.default_database_id, 
-            email
-        )
+        # mapping_database_id が指定されていればそちらを優先
+        target_db = self.mapping_database_id or self.default_database_id
+        database_users = await self.search_users_in_database(target_db, email)
         
         if database_users:
             logger.info(f"✅ データベースで発見: {database_users[0].name} ({email})")
@@ -91,7 +96,14 @@ class NotionUserRepositoryImpl(NotionUserRepositoryInterface):
             return unique_users
 
         except Exception as e:
-            logger.error(f"❌ データベース検索エラー: {e}")
+            # Notionの結合データベース（multi-source）に対するAPI制約の明示化
+            if "multiple data sources" in str(e).lower():
+                logger.error(
+                    "❌ データベース検索エラー: このデータベースは複数データソースに接続されています。"
+                    " Notion APIではqueryがサポートされないため、'mapping_database_id' に単一ソースのDBを指定してください。"
+                )
+            else:
+                logger.error(f"❌ データベース検索エラー: {e}")
             return []
 
     async def search_users_by_domain(self, domain: str) -> List[NotionUser]:

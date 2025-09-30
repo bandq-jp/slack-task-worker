@@ -1,5 +1,6 @@
 # CLAUDE.md
-
+既存のシステムはDDD/オニオンアーキテクチャに則って開発されてい
+▌ ますので、しっかりとディレクトリ構造も確認して開発を行ってください。
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview

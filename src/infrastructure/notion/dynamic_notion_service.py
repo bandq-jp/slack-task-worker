@@ -16,6 +16,7 @@ REMINDER_STAGE_BEFORE = "期日前"
 REMINDER_STAGE_DUE = "当日"
 REMINDER_STAGE_OVERDUE = "超過"
 REMINDER_STAGE_ACKED = "既読"
+REMINDER_STAGE_PENDING_APPROVAL = "未承認"
 
 EXTENSION_STATUS_NONE = "なし"
 EXTENSION_STATUS_PENDING = "申請中"
@@ -27,7 +28,17 @@ COMPLETION_STATUS_REQUESTED = "完了申請中"
 COMPLETION_STATUS_APPROVED = "完了承認"
 COMPLETION_STATUS_REJECTED = "完了却下"
 
-EXCLUDED_STATUSES_FOR_REMINDER = {"差し戻し", "完了", "無効"}
+TASK_STATUS_PENDING = "承認待ち"
+TASK_STATUS_APPROVED = "承認済み"
+TASK_STATUS_REJECTED = "差し戻し"
+TASK_STATUS_COMPLETED = "完了"
+TASK_STATUS_DISABLED = "無効"
+
+EXCLUDED_STATUSES_FOR_REMINDER = {
+    TASK_STATUS_REJECTED,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_DISABLED,
+}
 
 TASK_PROP_TITLE = "タイトル"
 TASK_PROP_DUE = "納期"
@@ -38,10 +49,11 @@ TASK_PROP_REMINDER_STAGE = "リマインドフェーズ"
 TASK_PROP_REMINDER_READ = "リマインド既読"
 TASK_PROP_LAST_REMIND_AT = "最終リマインド日時"
 TASK_PROP_LAST_READ_AT = "最終既読日時"
+TASK_PROP_DUE_READ = "当日既読"
+TASK_PROP_OVERDUE_READ = "超過既読"
 TASK_PROP_EXTENSION_STATUS = "延期ステータス"
 TASK_PROP_EXTENSION_DUE = "延期期日（申請中）"
 TASK_PROP_EXTENSION_REASON = "延期理由（申請中）"
-TASK_PROP_OVERDUE_POINTS = "納期超過ポイント"
 
 TASK_PROP_COMPLETION_STATUS = "完了ステータス"
 TASK_PROP_COMPLETION_REQUESTED_AT = "完了申請日時"
@@ -71,10 +83,13 @@ class NotionTaskSnapshot:
     reminder_last_sent_at: Optional[datetime]
     reminder_read: bool
     reminder_read_at: Optional[datetime]
+    due_stage_read: bool
+    overdue_stage_read: bool
+    has_due_read_prop: bool
+    has_overdue_read_prop: bool
     extension_status: Optional[str]
     extension_requested_due: Optional[datetime]
     extension_reason: Optional[str]
-    overdue_points: int
     completion_status: Optional[str]
     completion_requested_at: Optional[datetime]
     completion_note: Optional[str]
@@ -466,9 +481,6 @@ class DynamicNotionService:
                 TASK_PROP_REMINDER_READ: {
                     "checkbox": False,
                 },
-                TASK_PROP_OVERDUE_POINTS: {
-                    "number": 0,
-                },
                 TASK_PROP_EXTENSION_STATUS: {
                     "select": {"name": EXTENSION_STATUS_NONE},
                 },
@@ -640,6 +652,14 @@ class DynamicNotionService:
                 print("3. 「Task Request Bot」Integrationを招待")
                 print("4. 「招待」をクリック")
 
+            # 結合データベース（複数ソース）の場合
+            elif "multiple data sources" in str(e).lower():
+                print("\n🔧 データベース種別エラー:")
+                print("指定された NOTION_DATABASE_ID は複数のデータソースを結合したデータベース（リンク/結合ビュー）です。")
+                print("Notion APIではこの種別に対する query/create がサポートされません。")
+                print("- 対応策: 元の単一ソースのタスクDBのIDを NOTION_DATABASE_ID に設定してください。")
+                print("- 参考: データベースのURLから32桁のID（ハイフン除去）を設定します。")
+
             # データベースが見つからない場合
             elif "Could not find database" in str(e):
                 print("\n🔧 データベースIDエラー:")
@@ -663,13 +683,13 @@ class DynamicNotionService:
     def _get_status_name(self, status: str) -> str:
         """ステータスの表示名を取得"""
         status_map = {
-            "pending": "承認待ち",
-            "approved": "承認済み",
-            "rejected": "差し戻し",
-            "completed": "完了",
-            "disabled": "無効",
+            "pending": TASK_STATUS_PENDING,
+            "approved": TASK_STATUS_APPROVED,
+            "rejected": TASK_STATUS_REJECTED,
+            "completed": TASK_STATUS_COMPLETED,
+            "disabled": TASK_STATUS_DISABLED,
         }
-        return status_map.get(status, "承認待ち")
+        return status_map.get(status, TASK_STATUS_PENDING)
 
     async def get_task_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
         """タスクIDでNotionページを取得
@@ -793,8 +813,16 @@ class DynamicNotionService:
 
             if start_cursor:
                 query_payload["start_cursor"] = start_cursor
-
-            response = self.client.databases.query(**query_payload)
+            try:
+                response = self.client.databases.query(**query_payload)
+            except Exception as e:
+                if "multiple data sources" in str(e).lower():
+                    print("❌ Notionデータベースは複数ソースの結合DBのため、APIでの検索ができません。")
+                    print("   元の単一ソースDBのIDを NOTION_DATABASE_ID に設定してください。")
+                else:
+                    print(f"❌ Notionデータベース問い合わせエラー: {e}")
+                # 致命的なので以降の処理は打ち切り
+                break
             for page in response.get("results", []):
                 try:
                     snapshot = self._to_snapshot(page)
@@ -887,18 +915,9 @@ class DynamicNotionService:
         reminder_time: datetime,
     ) -> None:
         properties = {
-            TASK_PROP_REMINDER_STAGE: {
-                "select": {"name": stage},
-            },
-            TASK_PROP_REMINDER_READ: {
-                "checkbox": False,
-            },
-            TASK_PROP_LAST_REMIND_AT: {
-                "date": {"start": self._format_datetime(reminder_time)},
-            },
-            TASK_PROP_LAST_READ_AT: {
-                "date": None,
-            },
+            TASK_PROP_REMINDER_STAGE: {"select": {"name": stage}},
+            TASK_PROP_REMINDER_READ: {"checkbox": False},
+            TASK_PROP_LAST_REMIND_AT: {"date": {"start": self._format_datetime(reminder_time)}},
         }
 
         try:
@@ -912,23 +931,34 @@ class DynamicNotionService:
         read_time: datetime,
         stage: Optional[str] = None,
     ) -> None:
-        selected_stage = stage or REMINDER_STAGE_ACKED
-        properties = {
-            TASK_PROP_REMINDER_STAGE: {
-                "select": {"name": selected_stage},
-            },
-            TASK_PROP_REMINDER_READ: {
-                "checkbox": True,
-            },
-            TASK_PROP_LAST_READ_AT: {
-                "date": {"start": self._format_datetime(read_time)},
-            },
+        properties: Dict[str, Any] = {
+            TASK_PROP_LAST_READ_AT: {"date": {"start": self._format_datetime(read_time)}}
         }
+
+        # ステージ別の既読フラグを優先的に使用（存在しない場合でもAPIは無視するため安全）
+        if stage == REMINDER_STAGE_DUE:
+            properties[TASK_PROP_DUE_READ] = {"checkbox": True}
+        elif stage == REMINDER_STAGE_OVERDUE:
+            properties[TASK_PROP_OVERDUE_READ] = {"checkbox": True}
+        else:
+            # 後方互換: ステージ不明時は従来の既読フラグを立てる
+            properties[TASK_PROP_REMINDER_READ] = {"checkbox": True}
 
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
         except Exception as exc:
             print(f"⚠️ Failed to mark reminder as read: {exc}")
+            # フォールバック: ステージ別プロパティが存在しない場合は従来の既読フラグ/ステージを使用
+            try:
+                fallback_props: Dict[str, Any] = {
+                    TASK_PROP_REMINDER_STAGE: {"select": {"name": REMINDER_STAGE_ACKED}},
+                    TASK_PROP_REMINDER_READ: {"checkbox": True},
+                    TASK_PROP_LAST_READ_AT: {"date": {"start": self._format_datetime(read_time)}},
+                }
+                self.client.pages.update(page_id=page_id, properties=fallback_props)
+                print("🔁 Fallback: marked as read using legacy properties")
+            except Exception as exc2:
+                print(f"❌ Fallback failed to mark reminder as read: {exc2}")
 
     async def set_extension_request(
         self,
@@ -988,9 +1018,6 @@ class DynamicNotionService:
             TASK_PROP_LAST_READ_AT: {
                 "date": None,
             },
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": 0,
-            },
             TASK_PROP_COMPLETION_STATUS: {
                 "select": {"name": COMPLETION_STATUS_IN_PROGRESS},
             },
@@ -1021,18 +1048,6 @@ class DynamicNotionService:
             self.client.pages.update(page_id=page_id, properties=properties)
         except Exception as exc:
             print(f"⚠️ Failed to reject extension: {exc}")
-
-    async def set_overdue_points(self, page_id: str, points: int) -> None:
-        properties = {
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": points,
-            }
-        }
-
-        try:
-            self.client.pages.update(page_id=page_id, properties=properties)
-        except Exception as exc:
-            print(f"⚠️ Failed to update overdue points: {exc}")
 
     async def request_completion(
         self,
@@ -1077,11 +1092,6 @@ class DynamicNotionService:
         else:
             properties[TASK_PROP_COMPLETION_NOTE] = {"rich_text": []}
 
-        if requested_before_due:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
-        else:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
-
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
         except Exception as exc:
@@ -1107,11 +1117,6 @@ class DynamicNotionService:
                 "checkbox": True,
             },
         }
-
-        if requested_before_due:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 0}
-        else:
-            properties[TASK_PROP_OVERDUE_POINTS] = {"number": 1}
 
         try:
             self.client.pages.update(page_id=page_id, properties=properties)
@@ -1160,9 +1165,6 @@ class DynamicNotionService:
             TASK_PROP_LAST_READ_AT: {
                 "date": None,
             },
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": 0,
-            },
         }
 
         try:
@@ -1207,6 +1209,14 @@ class DynamicNotionService:
         last_read_at_prop = properties.get(TASK_PROP_LAST_READ_AT, {})
         reminder_read_at = self._parse_datetime(last_read_at_prop.get("date"))
 
+        # ステージ別の既読フラグ（存在しなければ False とする）
+        has_due_read_prop = TASK_PROP_DUE_READ in properties
+        due_read_prop = properties.get(TASK_PROP_DUE_READ, {})
+        due_stage_read = bool(due_read_prop.get("checkbox", False))
+        has_overdue_read_prop = TASK_PROP_OVERDUE_READ in properties
+        overdue_read_prop = properties.get(TASK_PROP_OVERDUE_READ, {})
+        overdue_stage_read = bool(overdue_read_prop.get("checkbox", False))
+
         extension_status_prop = properties.get(TASK_PROP_EXTENSION_STATUS, {})
         extension_status = None
         if extension_status_prop.get("select"):
@@ -1217,9 +1227,6 @@ class DynamicNotionService:
 
         extension_reason_prop = properties.get(TASK_PROP_EXTENSION_REASON)
         extension_reason = self._extract_rich_text(extension_reason_prop)
-
-        overdue_points_prop = properties.get(TASK_PROP_OVERDUE_POINTS, {})
-        overdue_points = int(overdue_points_prop.get("number")) if overdue_points_prop.get("number") is not None else 0
 
         completion_status_prop = properties.get(TASK_PROP_COMPLETION_STATUS, {})
         completion_status = None
@@ -1251,15 +1258,18 @@ class DynamicNotionService:
             reminder_last_sent_at=last_remind_at,
             reminder_read=reminder_read,
             reminder_read_at=reminder_read_at,
+            due_stage_read=due_stage_read,
+            overdue_stage_read=overdue_stage_read,
             extension_status=extension_status,
             extension_requested_due=extension_requested_due,
             extension_reason=extension_reason,
-            overdue_points=overdue_points,
             completion_status=completion_status,
             completion_requested_at=completion_requested_at,
             completion_note=completion_note,
             completion_approved_at=completion_approved_at,
             completion_reject_reason=completion_reject_reason,
+            has_due_read_prop=has_due_read_prop,
+            has_overdue_read_prop=has_overdue_read_prop,
         )
 
     async def update_task_status(
@@ -1359,9 +1369,6 @@ class DynamicNotionService:
             },
             TASK_PROP_EXTENSION_REASON: {
                 "rich_text": [],
-            },
-            TASK_PROP_OVERDUE_POINTS: {
-                "number": 0,
             },
             TASK_PROP_COMPLETION_STATUS: {
                 "select": {"name": COMPLETION_STATUS_IN_PROGRESS},

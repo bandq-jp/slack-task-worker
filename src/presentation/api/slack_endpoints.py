@@ -6,15 +6,19 @@ from typing import Dict, Any, Optional, List
 from src.application.services.task_service import TaskApplicationService
 from src.application.dto.task_dto import CreateTaskRequestDto, TaskApprovalDto, ReviseTaskRequestDto
 from src.infrastructure.slack.slack_service import SlackService, REMINDER_STAGE_LABELS
+from src.infrastructure.notion.admin_metrics_service import AdminMetricsNotionService
+from src.application.services.task_metrics_service import TaskMetricsApplicationService
 from src.infrastructure.notion.dynamic_notion_service import (
     DynamicNotionService,
     REMINDER_STAGE_BEFORE,
     REMINDER_STAGE_DUE,
     REMINDER_STAGE_OVERDUE,
-    EXTENSION_STATUS_APPROVED,
+    REMINDER_STAGE_PENDING_APPROVAL,
     EXTENSION_STATUS_PENDING,
     COMPLETION_STATUS_REQUESTED,
     COMPLETION_STATUS_APPROVED,
+    TASK_STATUS_PENDING,
+    TASK_STATUS_APPROVED,
 )
 from src.infrastructure.repositories.notion_user_repository_impl import NotionUserRepositoryImpl
 from src.infrastructure.repositories.slack_user_repository_impl import SlackUserRepositoryImpl
@@ -40,6 +44,8 @@ class Settings(BaseSettings):
     notion_database_id: str = ""
     notion_audit_database_id: str = ""
     mapping_database_id: str = ""
+    notion_metrics_database_id: str = ""
+    notion_assignee_summary_database_id: str = ""
     gcs_bucket_name: str = ""
     google_application_credentials: str = ""
     service_account_json: str = ""
@@ -80,7 +86,15 @@ print("🚀 Slack-Notion Task Management System initialized!")
 print(f"🌍 Environment: {settings.env}")
 print(f"📋 Slack Command: {settings.slack_command_name}{settings.app_name_suffix}")
 print(f"📊 Notion Database: {settings.notion_database_id}")
+if settings.notion_metrics_database_id:
+    print(f"📈 Metrics Database: {settings.notion_metrics_database_id}")
+if settings.notion_assignee_summary_database_id:
+    print(f"👤 Summary Database: {settings.notion_assignee_summary_database_id}")
 print("🔄 Using dynamic user search (no mapping files)")
+if settings.mapping_database_id:
+    print(f"🔗 Mapping Database: {settings.mapping_database_id} (used for user lookup)")
+else:
+    print("🔗 Mapping Database: (not set) — using main Notion DB for user lookup")
 
 # リポジトリとサービスのインスタンス化（DDD版DI）
 task_repository = InMemoryTaskRepository()
@@ -90,7 +104,8 @@ slack_service = SlackService(settings.slack_token, settings.slack_bot_token, set
 # 新しいDDD実装のサービス初期化
 notion_user_repository = NotionUserRepositoryImpl(
     notion_token=settings.notion_token,
-    default_database_id=settings.notion_database_id
+    default_database_id=settings.notion_database_id,
+    mapping_database_id=settings.mapping_database_id or None,
 )
 slack_user_repository = SlackUserRepositoryImpl(slack_token=settings.slack_bot_token)
 mapping_domain_service = UserMappingDomainService()
@@ -107,6 +122,12 @@ notion_service = DynamicNotionService(
     user_mapping_service=user_mapping_service,
     audit_database_id=settings.notion_audit_database_id,
 )
+admin_metrics_service = AdminMetricsNotionService(
+    notion_token=settings.notion_token,
+    metrics_database_id=settings.notion_metrics_database_id,
+    summary_database_id=settings.notion_assignee_summary_database_id,
+)
+task_metrics_service = TaskMetricsApplicationService(admin_metrics_service=admin_metrics_service)
 ai_service = (
     TaskAIService(
         settings.gemini_api_key,
@@ -123,6 +144,7 @@ task_service = TaskApplicationService(
     user_repository=user_repository,
     slack_service=slack_service,
     notion_service=notion_service,
+    task_metrics_service=task_metrics_service,
 )
 
 # Google Calendar サービスの初期化（オプショナル）
@@ -158,6 +180,8 @@ async def run_reminders():
     notifications: List[Dict[str, Any]] = []
     errors: List[str] = []
 
+    metrics_cache = await task_metrics_service.ensure_metrics_for_snapshots(snapshots)
+
     async def resolve_slack_id(email: Optional[str]) -> Optional[str]:
         if not email:
             return None
@@ -175,45 +199,57 @@ async def run_reminders():
         email_cache[email] = None
         return None
 
-    def determine_stage(snapshot) -> Optional[str]:
-        if snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
-            return None
-        due = snapshot.due_date
-        if not due:
-            return None
-        due_value = due.astimezone(timezone.utc) if due.tzinfo else due.replace(tzinfo=timezone.utc)
-        now_value = now
-        due_date_only = due_value.date()
-        today = now_value.date()
-
-        if snapshot.extension_status == EXTENSION_STATUS_PENDING:
-            return None
-
-        if due_date_only > today:
-            hours_until_due = (due_value - now_value).total_seconds() / 3600
-            if hours_until_due <= 24:
-                return REMINDER_STAGE_BEFORE
-            return None
-        if due_date_only == today:
-            if (due_value - now_value).total_seconds() >= 0:
-                return REMINDER_STAGE_DUE
-            return REMINDER_STAGE_OVERDUE
-        return REMINDER_STAGE_OVERDUE
-
     for snapshot in snapshots:
         try:
-            stage = determine_stage(snapshot)
+            stage = determine_reminder_stage(snapshot, now)
+
+            metrics = metrics_cache.get(snapshot.page_id)
 
             if stage is None:
-                if snapshot.overdue_points and snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
-                    await notion_service.set_overdue_points(snapshot.page_id, 0)
-                    snapshot.overdue_points = 0
-                elif snapshot.overdue_points and snapshot.completion_status != COMPLETION_STATUS_APPROVED:
-                    # leave as-is to reflect outstanding overdue
-                    pass
+                if metrics and metrics.overdue_points and _should_clear_overdue_points(snapshot, now):
+                    updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, 0)
+                    if updated_metrics:
+                        metrics_cache[snapshot.page_id] = updated_metrics
                 continue
 
-            if stage == snapshot.reminder_stage:
+            if stage == REMINDER_STAGE_PENDING_APPROVAL and metrics and metrics.overdue_points:
+                updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, 0)
+                if updated_metrics:
+                    metrics_cache[snapshot.page_id] = updated_metrics
+                    metrics = updated_metrics
+
+            # 通知の要否を判定
+            should_notify = False
+            if stage == REMINDER_STAGE_BEFORE:
+                # 期日前は一度だけ通知（従来通り）
+                should_notify = stage != snapshot.reminder_stage
+            elif stage == REMINDER_STAGE_DUE:
+                # 当日は既読になるまで毎回通知
+                due_read = getattr(snapshot, "due_stage_read", False)
+                has_due_prop = getattr(snapshot, "has_due_read_prop", False)
+                if has_due_prop:
+                    should_notify = not due_read
+                else:
+                    # 後方互換: 従来の既読フラグで制御（押されるまで送る）
+                    should_notify = not getattr(snapshot, "reminder_read", False)
+            elif stage == REMINDER_STAGE_OVERDUE:
+                # 超過は必ず一度は通知し、その後は既読で止める
+                overdue_read = getattr(snapshot, "overdue_stage_read", False)
+                has_overdue_prop = getattr(snapshot, "has_overdue_read_prop", False)
+                if has_overdue_prop:
+                    should_notify = not overdue_read
+                else:
+                    # 後方互換: ステージが超過に変わったら少なくとも一度は送る。以後は従来の既読で止める。
+                    if snapshot.reminder_stage != REMINDER_STAGE_OVERDUE:
+                        should_notify = True
+                    else:
+                        should_notify = not getattr(snapshot, "reminder_read", False)
+            else:
+                # その他はステージ変化時のみ
+                should_notify = stage != snapshot.reminder_stage
+
+            if not should_notify:
+                await task_metrics_service.update_reminder_stage(snapshot.page_id, stage, now)
                 continue
 
             assignee_slack_id = await resolve_slack_id(snapshot.assignee_email)
@@ -232,14 +268,21 @@ async def run_reminders():
                     snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}
                     and requested_before_due
                 )
-                target_points = 0 if (snapshot.extension_status == EXTENSION_STATUS_APPROVED or completion_safe) else 1
-                if snapshot.overdue_points != target_points:
-                    await notion_service.set_overdue_points(snapshot.page_id, target_points)
-                    snapshot.overdue_points = target_points
+                eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
+                target_points = 1 if (eligible_for_overdue_points and not completion_safe) else 0
+                current_points = metrics.overdue_points if metrics else 0
+                if current_points != target_points:
+                    updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, target_points)
+                    if updated_metrics:
+                        metrics_cache[snapshot.page_id] = updated_metrics
+                        metrics = updated_metrics
             else:
-                if snapshot.overdue_points:
-                    await notion_service.set_overdue_points(snapshot.page_id, 0)
-                    snapshot.overdue_points = 0
+                current_points = metrics.overdue_points if metrics else 0
+                if current_points and _should_clear_overdue_points(snapshot, now):
+                    updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, 0)
+                    if updated_metrics:
+                        metrics_cache[snapshot.page_id] = updated_metrics
+                        metrics = updated_metrics
 
             await slack_service.send_task_reminder(
                 assignee_slack_id=assignee_slack_id,
@@ -249,6 +292,8 @@ async def run_reminders():
             )
 
             await notion_service.update_reminder_state(snapshot.page_id, stage, now)
+            await task_metrics_service.update_reminder_stage(snapshot.page_id, stage, now)
+            snapshot.reminder_stage = stage
 
             detail = f"{REMINDER_STAGE_LABELS.get(stage, stage)}\n納期: {_format_datetime_text(snapshot.due_date)}"
             event_type = "期限超過" if stage == REMINDER_STAGE_OVERDUE else "リマインド送信"
@@ -270,6 +315,8 @@ async def run_reminders():
         except Exception as reminder_error:
             print(f"⚠️ Reminder processing failed for task {getattr(snapshot, 'page_id', 'unknown')}: {reminder_error}")
             errors.append(f"reminder_error:{getattr(snapshot, 'page_id', 'unknown')}")
+
+    await task_metrics_service.refresh_assignee_summaries()
 
     return {
         "timestamp": now.isoformat(),
@@ -795,13 +842,25 @@ async def handle_interactive(request: Request):
                     print(f"⚠️ Failed to notify user about missing requester Slack ID: {dm_error}")
                 return JSONResponse(content={})
 
-            await slack_service.open_completion_modal(
-                trigger_id=trigger_id,
-                snapshot=snapshot,
-                stage=stage,
-                requester_slack_id=requester_slack_id,
-                assignee_slack_id=user_id,
-            )
+            try:
+                await slack_service.open_completion_modal(
+                    trigger_id=trigger_id,
+                    snapshot=snapshot,
+                    stage=stage,
+                    requester_slack_id=requester_slack_id,
+                    assignee_slack_id=user_id,
+                )
+            except Exception as open_err:
+                print(f"⚠️ Failed to open completion modal: {open_err}")
+                # trigger_idの有効期限切れ等。ユーザーに再試行を促す
+                try:
+                    dm = slack_service.client.conversations_open(users=user_id)
+                    slack_service.client.chat_postMessage(
+                        channel=dm["channel"]["id"],
+                        text="モーダルを開けませんでした（数秒で失効するため）。もう一度ボタンを押してください。",
+                    )
+                except Exception as dm_error:
+                    print(f"⚠️ Failed to DM about modal open failure: {dm_error}")
             return JSONResponse(content={})
 
         elif action_id == "approve_completion_request":
@@ -838,8 +897,13 @@ async def handle_interactive(request: Request):
                         snapshot.completion_requested_at if snapshot else None,
                         snapshot.due_date if snapshot else None,
                     )
+                    eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
 
-                    await notion_service.approve_completion(page_id, approval_time, requested_before_due)
+                    await notion_service.approve_completion(
+                        page_id,
+                        approval_time,
+                        requested_before_due,
+                    )
                     await notion_service.update_task_status(page_id, "completed")
 
                     user_info = await slack_service.get_user_info(user_id)
@@ -872,6 +936,30 @@ async def handle_interactive(request: Request):
                         snapshot=snapshot,
                         approval_time=approval_time,
                     )
+
+                    target_points = 1 if (eligible_for_overdue_points and not requested_before_due) else 0
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+
+                    # 延期承認後の納期超過ポイントを即時再判定
+                    try:
+                        now_utc = datetime.now(timezone.utc)
+                        new_due_utc = snapshot_for_metrics.due_date.astimezone(timezone.utc) if snapshot_for_metrics.due_date else None
+                        still_overdue = bool(new_due_utc and new_due_utc <= now_utc)
+                        eligible_status = getattr(snapshot_for_metrics, "status", None) == TASK_STATUS_APPROVED
+                        target_points = 1 if (still_overdue and eligible_status) else 0
+                        # 変更がある場合のみ更新
+                        metrics = await task_metrics_service.admin_metrics_service.get_metrics_by_task_id(page_id)
+                        current_points = metrics.overdue_points if metrics else 0
+                        if current_points != target_points:
+                            await task_metrics_service.update_overdue_points(page_id, target_points)
+                    except Exception as pts_err:
+                        print(f"⚠️ Failed to update overdue points after extension approval: {pts_err}")
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        overdue_points=target_points,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
 
                 except Exception as approval_error:
                     print(f"⚠️ Completion approval failed: {approval_error}")
@@ -977,6 +1065,14 @@ async def handle_interactive(request: Request):
                         new_due=approved_due,
                     )
 
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        reminder_stage=snapshot_for_metrics.reminder_stage,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
+
                 except Exception as approval_error:
                     print(f"⚠️ Extension approval failed: {approval_error}")
 
@@ -1035,6 +1131,14 @@ async def handle_interactive(request: Request):
                         requester_slack_id=requester_slack_id,
                         snapshot=snapshot,
                     )
+
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        reminder_stage=snapshot_for_metrics.reminder_stage,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
 
                 except Exception as rejection_error:
                     print(f"⚠️ Extension rejection failed: {rejection_error}")
@@ -1639,6 +1743,7 @@ async def handle_interactive(request: Request):
                         raise ValueError("依頼者のSlackアカウントが見つかりません")
 
                     requested_before_due = _requested_on_time(requested_at, snapshot.due_date)
+                    eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
 
                     await notion_service.request_completion(
                         page_id=page_id,
@@ -1646,6 +1751,15 @@ async def handle_interactive(request: Request):
                         note=note,
                         requested_before_due=requested_before_due,
                     )
+
+                    target_points = 1 if (eligible_for_overdue_points and not requested_before_due) else 0
+                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
+                    snapshot_for_metrics = refreshed_snapshot or snapshot
+                    await task_metrics_service.sync_snapshot(
+                        snapshot_for_metrics,
+                        overdue_points=target_points,
+                    )
+                    await task_metrics_service.refresh_assignee_summaries()
 
                     await notion_service.record_audit_log(
                         task_page_id=page_id,
@@ -1943,6 +2057,65 @@ def _requested_on_time(requested_at: Optional[datetime], due: Optional[datetime]
     if not req_utc or not due_utc:
         return False
     return req_utc <= due_utc
+
+
+def determine_reminder_stage(snapshot, reference_time: datetime) -> Optional[str]:
+    """リマインド対象ステージを判定"""
+    task_status = getattr(snapshot, "status", None)
+    if task_status == TASK_STATUS_PENDING:
+        return REMINDER_STAGE_PENDING_APPROVAL
+
+    if snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
+        return None
+
+    due = getattr(snapshot, "due_date", None)
+    if not due:
+        return None
+
+    due_value = due.astimezone(timezone.utc) if due.tzinfo else due.replace(tzinfo=timezone.utc)
+    now_value = reference_time
+
+    if snapshot.extension_status == EXTENSION_STATUS_PENDING:
+        return None
+
+    due_date_only = due_value.date()
+    today = now_value.date()
+
+    if due_date_only > today:
+        hours_until_due = (due_value - now_value).total_seconds() / 3600
+        if hours_until_due <= 24:
+            return REMINDER_STAGE_BEFORE
+        return None
+
+    if due_date_only == today:
+        if (due_value - now_value).total_seconds() >= 0:
+            return REMINDER_STAGE_DUE
+        return REMINDER_STAGE_OVERDUE
+
+    return REMINDER_STAGE_OVERDUE
+
+
+def _should_clear_overdue_points(snapshot, reference_time: datetime) -> bool:
+    """納期超過ポイントをクリアすべきかどうか判定"""
+    due = getattr(snapshot, "due_date", None)
+    due_utc = _to_utc(due)
+    now_utc = _to_utc(reference_time)
+
+    # 納期が存在せず、あるいは未来に再設定された場合はクリア
+    if not due_utc or (now_utc and due_utc > now_utc):
+        return True
+
+    # タスクが承認待ちのままならポイントは付与しない
+    if getattr(snapshot, "status", None) == TASK_STATUS_PENDING:
+        return True
+
+    completion_status = getattr(snapshot, "completion_status", None)
+    if completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
+        requested_at = getattr(snapshot, "completion_requested_at", None)
+        if _requested_on_time(requested_at, due):
+            return True
+
+    return False
 
 
 def _extract_plain_text_from_rich_text(rich_text: Dict[str, Any]) -> str:
