@@ -943,6 +943,251 @@ class SlackService:
         except SlackApiError as e:
             print(f"Error notifying completion rejection: {e}")
 
+    async def send_task_approval_reminder(
+        self,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+        snapshot,
+    ) -> Dict[str, Any]:
+        """タスク承認待ちリマインド通知を送信（担当者と依頼者の両方へ）"""
+        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+
+        # 担当者（承認者）への通知
+        try:
+            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            assignee_blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "📝 タスク承認待ちリマインド",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"以下のタスクの承認をお願いします。\n\n*タスク:* <{notion_url}|{snapshot.title}>\n*依頼者:* <@{requester_slack_id}>",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ 承認"},
+                            "style": "primary",
+                            "value": snapshot.page_id,
+                            "action_id": "approve_task_from_reminder",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "❌ 差し戻し"},
+                            "style": "danger",
+                            "value": snapshot.page_id,
+                            "action_id": "reject_task_from_reminder",
+                        },
+                    ],
+                },
+            ]
+
+            self.client.chat_postMessage(
+                channel=assignee_dm["channel"]["id"],
+                text="📝 タスク承認待ちリマインド",
+                blocks=assignee_blocks,
+            )
+        except SlackApiError as e:
+            print(f"Error sending task approval reminder to assignee: {e}")
+
+        # 依頼者への通知
+        try:
+            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            requester_blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "⏳ タスク承認待ち",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"以下のタスクがまだ承認されていません。\n\n*タスク:* <{notion_url}|{snapshot.title}>\n*担当者:* <@{assignee_slack_id}>",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "🗑️ タスク削除"},
+                            "style": "danger",
+                            "value": json.dumps({
+                                "page_id": snapshot.page_id,
+                                "requester_slack_id": requester_slack_id,
+                            }),
+                            "action_id": "delete_pending_task",
+                            "confirm": {
+                                "title": {"type": "plain_text", "text": "タスクを削除しますか？"},
+                                "text": {"type": "mrkdwn", "text": "この操作は取り消せません。"},
+                                "confirm": {"type": "plain_text", "text": "削除する"},
+                                "deny": {"type": "plain_text", "text": "キャンセル"},
+                            },
+                        },
+                    ],
+                },
+            ]
+
+            return self.client.chat_postMessage(
+                channel=requester_dm["channel"]["id"],
+                text="⏳ タスク承認待ち",
+                blocks=requester_blocks,
+            )
+        except SlackApiError as e:
+            print(f"Error sending task approval reminder to requester: {e}")
+            raise
+
+    async def send_completion_approval_reminder(
+        self,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+        snapshot,
+    ) -> Dict[str, Any]:
+        """完了承認待ちリマインド通知を送信（依頼者と担当者の両方へ）"""
+        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+
+        # 依頼者（承認者）への通知
+        try:
+            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            requester_blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "✅ 完了承認待ちリマインド",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"以下のタスクの完了承認をお願いします。\n\n*タスク:* <{notion_url}|{snapshot.title}>\n*担当者:* <@{assignee_slack_id}>",
+                    },
+                },
+            ]
+
+            self.client.chat_postMessage(
+                channel=requester_dm["channel"]["id"],
+                text="✅ 完了承認待ちリマインド",
+                blocks=requester_blocks,
+            )
+        except SlackApiError as e:
+            print(f"Error sending completion approval reminder to requester: {e}")
+
+        # 担当者への通知
+        try:
+            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            assignee_blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "⏳ 完了承認待ち",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"以下のタスクの完了承認待ちです。\n\n*タスク:* <{notion_url}|{snapshot.title}>\n*依頼者:* <@{requester_slack_id}>",
+                    },
+                },
+            ]
+
+            return self.client.chat_postMessage(
+                channel=assignee_dm["channel"]["id"],
+                text="⏳ 完了承認待ち",
+                blocks=assignee_blocks,
+            )
+        except SlackApiError as e:
+            print(f"Error sending completion approval reminder to assignee: {e}")
+            raise
+
+    async def send_extension_approval_reminder(
+        self,
+        assignee_slack_id: str,
+        requester_slack_id: str,
+        snapshot,
+    ) -> Dict[str, Any]:
+        """延期承認待ちリマインド通知を送信（依頼者と担当者の両方へ）"""
+        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+        requested_due_text = self._format_datetime(snapshot.extension_requested_due) if snapshot.extension_requested_due else "未設定"
+
+        # 依頼者（承認者）への通知
+        try:
+            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            requester_blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "⏳ 延期承認待ちリマインド",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"以下のタスクの延期承認をお願いします。\n\n*タスク:* <{notion_url}|{snapshot.title}>\n*担当者:* <@{assignee_slack_id}>\n*希望納期:* {requested_due_text}\n*理由:* {snapshot.extension_reason or '未記入'}",
+                    },
+                },
+            ]
+
+            self.client.chat_postMessage(
+                channel=requester_dm["channel"]["id"],
+                text="⏳ 延期承認待ちリマインド",
+                blocks=requester_blocks,
+            )
+        except SlackApiError as e:
+            print(f"Error sending extension approval reminder to requester: {e}")
+
+        # 担当者への通知
+        try:
+            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            assignee_blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "⏳ 延期承認待ち",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"以下のタスクの延期承認待ちです。\n\n*タスク:* <{notion_url}|{snapshot.title}>\n*依頼者:* <@{requester_slack_id}>\n*希望納期:* {requested_due_text}",
+                    },
+                },
+            ]
+
+            return self.client.chat_postMessage(
+                channel=assignee_dm["channel"]["id"],
+                text="⏳ 延期承認待ち",
+                blocks=assignee_blocks,
+            )
+        except SlackApiError as e:
+            print(f"Error sending extension approval reminder to assignee: {e}")
+            raise
+
     async def open_completion_reject_modal(
         self,
         trigger_id: str,
