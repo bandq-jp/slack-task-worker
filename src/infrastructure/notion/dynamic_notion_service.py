@@ -65,6 +65,12 @@ TASK_PROP_APPROVAL_REMINDER_AT = "承認リマインド最終送信日時"
 TASK_PROP_EXTENSION_REQUESTED_AT = "延期申請日時"
 TASK_PROP_TASK_APPROVAL_REQUESTED_AT = "タスク承認開始日時"
 
+# Slackスレッド管理用プロパティ
+TASK_PROP_ASSIGNEE_THREAD_TS = "依頼先スレッドTS"
+TASK_PROP_ASSIGNEE_THREAD_CHANNEL = "依頼先スレッドチャンネル"
+TASK_PROP_REQUESTER_THREAD_TS = "依頼者スレッドTS"
+TASK_PROP_REQUESTER_THREAD_CHANNEL = "依頼者スレッドチャンネル"
+
 AUDIT_PROP_TITLE = "イベント"
 AUDIT_PROP_EVENT_TYPE = "種別"
 AUDIT_PROP_TASK_RELATION = "関連タスク"
@@ -103,6 +109,11 @@ class NotionTaskSnapshot:
     approval_reminder_last_sent_at: Optional[datetime]
     extension_requested_at: Optional[datetime]
     task_approval_requested_at: Optional[datetime]
+    # Slackスレッド管理用
+    assignee_thread_ts: Optional[str]
+    assignee_thread_channel: Optional[str]
+    requester_thread_ts: Optional[str]
+    requester_thread_channel: Optional[str]
 
 
 class DynamicNotionService:
@@ -1049,6 +1060,47 @@ class DynamicNotionService:
             print(f"⚠️ Failed to disable task in Notion: {exc}")
             raise
 
+    async def save_thread_info(
+        self,
+        page_id: str,
+        assignee_thread_ts: Optional[str] = None,
+        assignee_thread_channel: Optional[str] = None,
+        requester_thread_ts: Optional[str] = None,
+        requester_thread_channel: Optional[str] = None,
+    ) -> None:
+        """Slackスレッド情報をNotionに保存"""
+        properties: Dict[str, Any] = {}
+
+        if assignee_thread_ts:
+            properties[TASK_PROP_ASSIGNEE_THREAD_TS] = {
+                "rich_text": [{"text": {"content": assignee_thread_ts}}]
+            }
+
+        if assignee_thread_channel:
+            properties[TASK_PROP_ASSIGNEE_THREAD_CHANNEL] = {
+                "rich_text": [{"text": {"content": assignee_thread_channel}}]
+            }
+
+        if requester_thread_ts:
+            properties[TASK_PROP_REQUESTER_THREAD_TS] = {
+                "rich_text": [{"text": {"content": requester_thread_ts}}]
+            }
+
+        if requester_thread_channel:
+            properties[TASK_PROP_REQUESTER_THREAD_CHANNEL] = {
+                "rich_text": [{"text": {"content": requester_thread_channel}}]
+            }
+
+        if not properties:
+            return
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+            print(f"✅ Saved thread info for task {page_id}")
+        except Exception as exc:
+            print(f"⚠️ Failed to save thread info to Notion: {exc}")
+            # スレッド情報の保存失敗は致命的ではないので、エラーを投げない
+
     async def mark_reminder_read(
         self,
         page_id: str,
@@ -1384,6 +1436,19 @@ class DynamicNotionService:
         task_approval_requested_at_prop = properties.get(TASK_PROP_TASK_APPROVAL_REQUESTED_AT, {})
         task_approval_requested_at = self._parse_datetime(task_approval_requested_at_prop.get("date"))
 
+        # Slackスレッド情報を取得
+        assignee_thread_ts_prop = properties.get(TASK_PROP_ASSIGNEE_THREAD_TS)
+        assignee_thread_ts = self._extract_rich_text(assignee_thread_ts_prop)
+
+        assignee_thread_channel_prop = properties.get(TASK_PROP_ASSIGNEE_THREAD_CHANNEL)
+        assignee_thread_channel = self._extract_rich_text(assignee_thread_channel_prop)
+
+        requester_thread_ts_prop = properties.get(TASK_PROP_REQUESTER_THREAD_TS)
+        requester_thread_ts = self._extract_rich_text(requester_thread_ts_prop)
+
+        requester_thread_channel_prop = properties.get(TASK_PROP_REQUESTER_THREAD_CHANNEL)
+        requester_thread_channel = self._extract_rich_text(requester_thread_channel_prop)
+
         return NotionTaskSnapshot(
             page_id=page.get("id"),
             title=title,
@@ -1413,6 +1478,10 @@ class DynamicNotionService:
             approval_reminder_last_sent_at=approval_reminder_last_sent_at,
             extension_requested_at=extension_requested_at,
             task_approval_requested_at=task_approval_requested_at,
+            assignee_thread_ts=assignee_thread_ts,
+            assignee_thread_channel=assignee_thread_channel,
+            requester_thread_ts=requester_thread_ts,
+            requester_thread_channel=requester_thread_channel,
         )
 
     async def update_task_status(

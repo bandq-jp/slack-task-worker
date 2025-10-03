@@ -465,272 +465,90 @@ async def handle_interactive(request: Request):
         # ボタンアクションの処理
         action = payload["actions"][0]
         action_id = action["action_id"]
-        task_id = action.get("value", "")
+        value_str = action.get("value", "")
         trigger_id = payload["trigger_id"]
         view = payload.get("view", {})
         view_id = view.get("id")
         user_id = payload.get("user", {}).get("id", "unknown")
-        
+
         print(f"🎯 Block action received: action_id={action_id}, user_id={user_id}")
         print(f"🔍 Available actions: {[a.get('action_id') for a in payload.get('actions', [])]}")
+        print(f"🔍 Button value: {value_str}")
+
+        # valueからtask_idとpage_idを取得
+        try:
+            value_data = json.loads(value_str)
+            task_id = value_data.get("task_id")
+            page_id = value_data.get("page_id")
+            print(f"🔍 Parsed: task_id={task_id}, page_id={page_id}")
+        except (json.JSONDecodeError, AttributeError):
+            # 古い形式のボタン（valueが直接task_id）の場合
+            task_id = value_str
+            page_id = None
+            print(f"🔍 Legacy format: task_id={task_id}")
 
         if action_id == "approve_task":
-            try:
-                # 即座にローディング表示（3秒制限回避）
-                loading_response = {
-                    "response_action": "update",
-                    "text": "⏳ タスクを承認中...",
-                    "blocks": [
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": "⏳ *タスクを承認しています...*\n\nしばらくお待ちください。"
-                            }
-                        }
-                    ]
-                }
-                
-                # バックグラウンドで承認処理を実行
-                import asyncio
-                
-                async def run_approval():
-                    try:
-                        dto = TaskApprovalDto(
-                            task_id=task_id,
-                            action="approve",
-                            rejection_reason=None,
-                        )
-                        approval_result = await task_service.handle_task_approval(dto)
-                        print("✅ 承認処理成功")
+            # 即座に空のレスポンスを返す（3秒制限回避）
+            import asyncio
 
-                        # Google Calendar にタスクを追加（オプショナル）
-                        calendar_notes: List[str] = []
-                        saved_task = None
-                        if calendar_task_service:
-                            try:
-                                # まずTaskRequestを取得してnotion_page_idを確認
-                                saved_task = await task_service.task_repository.find_by_id(task_id)
-                                if saved_task and saved_task.notion_page_id:
-                                    print(f"🔍 TaskRequest found: {task_id}, notion_page_id: {saved_task.notion_page_id}")
-                                    # Notionからタスク情報を取得
-                                    task_data = await notion_service.get_task_by_id(saved_task.notion_page_id)
-                                    if task_data:
-                                        # 承認者のSlack IDを取得
-                                        approver_slack_id = payload.get("user", {}).get("id")
+            async def run_approval():
+                try:
+                    print(f"🔄 承認処理開始: task_id={task_id}")
 
-                                        # カレンダータスクを作成
-                                        calendar_task = await calendar_task_service.create_task_on_approval(
-                                            task_data=task_data,
-                                            approver_slack_user_id=approver_slack_id
-                                        )
+                    dto = TaskApprovalDto(
+                        task_id=task_id,
+                        action="approve",
+                        rejection_reason=None,
+                    )
 
-                                        if calendar_task:
-                                            calendar_notes.append("📅 Googleカレンダーのタスクに追加しました")
-                                            print("✅ Google Calendar task created")
-                                        else:
-                                            calendar_notes.append("⚠️ Googleカレンダーへの追加はスキップされました（メールアドレスが見つかりません）")
-                                    else:
-                                        calendar_notes.append("⚠️ Notionからタスクデータを取得できませんでした")
-                                        print(f"⚠️ Could not get task data from Notion for page_id: {saved_task.notion_page_id}")
-                                else:
-                                    calendar_notes.append("⚠️ タスクまたはNotionページIDが見つかりません")
-                                    print(f"⚠️ TaskRequest not found or missing notion_page_id: task_id={task_id}")
-                            except Exception as cal_error:
-                                print(f"⚠️ Calendar task creation error: {cal_error}")
-                                calendar_notes.append("⚠️ Googleカレンダーへの追加に失敗しました")
+                    # handle_task_approvalが親メッセージを更新し、通知も送信する
+                    await task_service.handle_task_approval(dto)
+                    print("✅ 承認処理成功 - 親メッセージとスレッド通知が送信されました")
 
-                        # 成功メッセージを表示（チャンネル、TS、メッセージIDが必要）
-                        # Slack メッセージ更新のためのチャンネルとTSを取得
-                        message = payload.get("message", {})
-                        channel = payload.get("channel", {}).get("id")
-                        message_ts = message.get("ts")
-                        
-                        if channel and message_ts:
-                            try:
-                                if not saved_task:
+                    # Google Calendarにタスクを追加（オプショナル）
+                    if calendar_task_service and page_id:
+                        try:
+                            # Notionからタスク情報を取得
+                            task_data = await notion_service.get_task_by_id(page_id)
+                            if task_data:
+                                # 承認者のSlack IDを取得
+                                approver_slack_id = payload.get("user", {}).get("id")
+
+                                # カレンダータスクを作成
+                                calendar_task = await calendar_task_service.create_task_on_approval(
+                                    task_data=task_data,
+                                    approver_slack_user_id=approver_slack_id
+                                )
+
+                                if calendar_task:
+                                    print("✅ Google Calendar task created")
+                                    # スレッド情報を取得してスレッド返信
                                     saved_task = await task_service.task_repository.find_by_id(task_id)
+                                    if saved_task and saved_task.notion_page_id:
+                                        snapshot = await notion_service.get_task_snapshot(saved_task.notion_page_id)
+                                        if snapshot and snapshot.assignee_thread_ts and snapshot.assignee_thread_channel:
+                                            await slack_service.client.chat_postMessage(
+                                                channel=snapshot.assignee_thread_channel,
+                                                thread_ts=snapshot.assignee_thread_ts,
+                                                text="📅 Googleカレンダーのタスクに追加しました",
+                                            )
+                                else:
+                                    print("⚠️ Calendar task creation skipped (no email found)")
+                            else:
+                                print(f"⚠️ Could not get task data from Notion for page_id: {page_id}")
+                        except Exception as cal_error:
+                            print(f"⚠️ Calendar task creation error: {cal_error}")
 
-                                notion_page_id = approval_result.notion_page_id or (
-                                    saved_task.notion_page_id if saved_task else None
-                                )
-                                requester_slack_id = approval_result.requester_slack_id or (
-                                    saved_task.requester_slack_id if saved_task else None
-                                )
-                                title_text = (approval_result.title or (saved_task.title if saved_task else "タスク")).strip()
-                                title_text = title_text.replace("\n", " ")
-                                stage_label = REMINDER_STAGE_LABELS.get("承認済", "承認済み")
-                                header_text = f"{stage_label} - {title_text}"[:150]
+                except Exception as e:
+                    print(f"❌ 承認処理エラー: {e}")
+                    import traceback
+                    traceback.print_exc()
 
-                                status_lines = ["✅ このタスクは承認され、Notionに登録されました"]
-                                status_lines.extend(calendar_notes)
-                                status_text = "\n".join(status_lines)
+            # 非同期タスクを開始
+            asyncio.create_task(run_approval())
 
-                                blocks: List[Dict[str, Any]] = [
-                                    {
-                                        "type": "header",
-                                        "text": {"type": "plain_text", "text": header_text, "emoji": True},
-                                    },
-                                    {
-                                        "type": "section",
-                                        "text": {"type": "mrkdwn", "text": status_text},
-                                    },
-                                ]
-
-                                action_payload = None
-                                notion_url = None
-                                if notion_page_id:
-                                    notion_url = f"https://www.notion.so/{notion_page_id.replace('-', '')}"
-                                    title_display = title_text or "(件名未設定)"
-                                    due_source = approval_result.due_date or (saved_task.due_date if saved_task else None)
-                                    due_text = _format_datetime_text(due_source)
-
-                                    blocks.append(
-                                        {
-                                            "type": "section",
-                                            "fields": [
-                                                {
-                                                    "type": "mrkdwn",
-                                                    "text": f"件名: <{notion_url}|{title_display}>",
-                                                },
-                                                {
-                                                    "type": "mrkdwn",
-                                                    "text": f"納期: {due_text if due_text else '-'}",
-                                                },
-                                            ],
-                                        }
-                                    )
-
-                                    if requester_slack_id:
-                                        action_payload = json.dumps(
-                                            {
-                                                "page_id": notion_page_id,
-                                                "stage": "承認済",
-                                                "requester_slack_id": requester_slack_id,
-                                            }
-                                        )
-
-                                action_elements: List[Dict[str, Any]] = []
-                                if notion_url:
-                                    action_elements.append(
-                                        {
-                                            "type": "button",
-                                            "action_id": "open_notion_page",
-                                            "text": {"type": "plain_text", "text": "📝 Notionを開く", "emoji": True},
-                                            "url": notion_url,
-                                        }
-                                    )
-
-                                if action_payload:
-                                    action_elements.append(
-                                        {
-                                            "type": "button",
-                                            "text": {"type": "plain_text", "text": "✅ 完了報告", "emoji": True},
-                                            "style": "primary",
-                                            "action_id": "open_completion_modal",
-                                            "value": action_payload,
-                                        }
-                                    )
-                                    action_elements.append(
-                                        {
-                                            "type": "button",
-                                            "text": {"type": "plain_text", "text": "⏳ 延期申請", "emoji": True},
-                                            "action_id": "open_extension_modal",
-                                            "value": action_payload,
-                                        }
-                                    )
-
-                                if action_elements:
-                                    blocks.append(
-                                        {
-                                            "type": "actions",
-                                            "elements": action_elements,
-                                        }
-                                    )
-
-                                if action_payload:
-                                    blocks.append(
-                                        {
-                                            "type": "context",
-                                            "elements": [
-                                                {
-                                                    "type": "mrkdwn",
-                                                    "text": "完了報告は依頼者に送信されます。延期申請は依頼者による承認後に反映されます。",
-                                                }
-                                            ],
-                                        }
-                                    )
-
-                                slack_service.client.chat_update(
-                                    channel=channel,
-                                    ts=message_ts,
-                                    text="✅ タスクを承認しました",
-                                    blocks=blocks,
-                                )
-                            except Exception as update_error:
-                                print(f"⚠️ メッセージ更新エラー: {update_error}")
-                                
-                    except Exception as e:
-                        print(f"❌ 承認処理エラー: {e}")
-                        
-                        # エラー時の表示（再試行ボタン付き）
-                        message = payload.get("message", {})
-                        channel = payload.get("channel", {}).get("id")
-                        message_ts = message.get("ts")
-                        
-                        if channel and message_ts:
-                            try:
-                                slack_service.client.chat_update(
-                                    channel=channel,
-                                    ts=message_ts,
-                                    text="❌ 承認処理でエラーが発生しました",
-                                    blocks=[
-                                        {
-                                            "type": "section",
-                                            "text": {
-                                                "type": "mrkdwn",
-                                                "text": f"❌ *承認処理でエラーが発生しました*\n\n{str(e)}"
-                                            }
-                                        },
-                                        {
-                                            "type": "actions",
-                                            "elements": [
-                                                {
-                                                    "type": "button",
-                                                    "text": {"type": "plain_text", "text": "🔄 再試行"},
-                                                    "style": "primary",
-                                                    "value": task_id,
-                                                    "action_id": "approve_task",
-                                                },
-                                            ]
-                                        }
-                                    ]
-                                )
-                            except Exception as update_error:
-                                print(f"⚠️ エラーメッセージ更新失敗: {update_error}")
-                
-                # 非同期タスクを開始
-                asyncio.create_task(run_approval())
-                
-                # 即座にローディング表示を返す
-                return JSONResponse(content=loading_response)
-            except ValueError as e:
-                # エラーメッセージを表示
-                return JSONResponse(
-                    content={
-                        "response_action": "update",
-                        "text": "❌ 承認処理でエラーが発生しました",
-                        "blocks": [
-                            {
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": f"❌ エラー: {str(e)}",
-                                },
-                            }
-                        ],
-                    }
-                )
+            # 即座に空のレスポンスを返す（3秒制限回避）
+            return JSONResponse(content={})
 
         elif action_id == "reject_task":
             # 差し戻しモーダルを開く
