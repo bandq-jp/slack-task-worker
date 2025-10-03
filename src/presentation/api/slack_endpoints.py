@@ -212,12 +212,6 @@ async def run_reminders():
                         metrics_cache[snapshot.page_id] = updated_metrics
                 continue
 
-            if stage == REMINDER_STAGE_PENDING_APPROVAL and metrics and metrics.overdue_points:
-                updated_metrics = await task_metrics_service.update_overdue_points(snapshot.page_id, 0)
-                if updated_metrics:
-                    metrics_cache[snapshot.page_id] = updated_metrics
-                    metrics = updated_metrics
-
             # 通知の要否を判定
             should_notify = False
             if stage == REMINDER_STAGE_BEFORE:
@@ -339,6 +333,7 @@ async def run_reminders():
                     # フォールバック: タスク承認開始日時が設定されていない場合はcreated_timeを使用
                     if not start_time:
                         start_time = snapshot.created_time
+                        print(f"  ⚠️ タスク承認開始日時が未設定、created_timeを使用: {start_time}")
                 elif snapshot.completion_status == COMPLETION_STATUS_REQUESTED:
                     approval_type = "completion_approval"
                     start_time = snapshot.completion_requested_at
@@ -347,10 +342,16 @@ async def run_reminders():
                     start_time = snapshot.extension_requested_at
 
                 if not approval_type or not start_time:
+                    print(f"  ⏭️ スキップ: approval_type={approval_type}, start_time={start_time}")
                     continue
 
                 # 6時間経過判定
                 hours_elapsed = (now - start_time).total_seconds() / 3600
+                print(f"  📅 タスク: {snapshot.title}")
+                print(f"     承認タイプ: {approval_type}")
+                print(f"     開始日時: {start_time}")
+                print(f"     経過時間: {hours_elapsed:.2f}時間")
+                print(f"     閾値: {APPROVAL_REMINDER_THRESHOLD_HOURS}時間")
 
                 # 前回リマインド送信からも6時間経過しているか確認
                 last_reminder = snapshot.approval_reminder_last_sent_at
@@ -359,6 +360,10 @@ async def run_reminders():
                 if last_reminder:
                     hours_since_last_reminder = (now - last_reminder).total_seconds() / 3600
                     should_send_reminder = hours_since_last_reminder >= APPROVAL_REMINDER_THRESHOLD_HOURS
+                    print(f"     前回リマインド: {last_reminder}")
+                    print(f"     前回から経過: {hours_since_last_reminder:.2f}時間")
+
+                print(f"     リマインド送信: {'✅ YES' if should_send_reminder else '❌ NO'}")
 
                 if not should_send_reminder:
                     continue
@@ -2305,10 +2310,14 @@ def _requested_on_time(requested_at: Optional[datetime], due: Optional[datetime]
 
 
 def determine_reminder_stage(snapshot, reference_time: datetime) -> Optional[str]:
-    """リマインド対象ステージを判定"""
+    """リマインド対象ステージを判定（納期リマインド用）
+
+    承認待ちタスクは納期リマインド対象外（承認待ちリマインドで別途処理）
+    """
     task_status = getattr(snapshot, "status", None)
     if task_status == TASK_STATUS_PENDING:
-        return REMINDER_STAGE_PENDING_APPROVAL
+        # 承認待ちタスクは納期リマインド対象外
+        return None
 
     if snapshot.completion_status in {COMPLETION_STATUS_REQUESTED, COMPLETION_STATUS_APPROVED}:
         return None
