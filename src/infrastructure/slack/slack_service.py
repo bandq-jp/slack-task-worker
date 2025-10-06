@@ -673,11 +673,28 @@ class SlackService:
                 },
             ]
 
+            # 当日リマインドの場合は既読ボタンを追加
+            if stage == "当日":
+                blocks.append(
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "✅ 既読にする", "emoji": True},
+                                "action_id": "mark_reminder_read",
+                                "value": json.dumps({"page_id": snapshot.page_id, "stage": stage}),
+                                "style": "primary",
+                            }
+                        ],
+                    }
+                )
+
             # スレッド返信として送信（@メンションで通知）
             return self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
-                text=f"@{assignee_slack_id} {stage_label}",
+                text=f"<@{assignee_slack_id}> {stage_label}",
                 thread_ts=thread_ts,
             )
 
@@ -821,11 +838,11 @@ class SlackService:
                 },
             ]
 
-            # スレッドで送信
+            # スレッドで送信（メンション付き）
             return self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
-                text=f"延期承認リクエスト: {snapshot.title}",
+                text=f"<@{requester_slack_id}> 延期承認リクエスト: {snapshot.title}",
                 thread_ts=thread_ts,
             )
 
@@ -837,24 +854,35 @@ class SlackService:
         self,
         assignee_slack_id: str,
         requested_due: datetime,
+        thread_channel: Optional[str] = None,
+        thread_ts: Optional[str] = None,
     ) -> None:
+        """延期申請送信完了通知（スレッド返信）"""
         try:
-            dm_response = self.client.conversations_open(users=assignee_slack_id)
-            channel_id = dm_response["channel"]["id"]
-
-            self.client.chat_postMessage(
-                channel=channel_id,
-                text="延期申請を送信しました。依頼者の承認をお待ちください。",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"⏳ 延期申請を送信しました。\n希望納期: {self._format_datetime(requested_due)}",
-                        },
-                    }
-                ],
-            )
+            # スレッド情報があればスレッドに返信、なければDM
+            if thread_channel and thread_ts:
+                self.client.chat_postMessage(
+                    channel=thread_channel,
+                    thread_ts=thread_ts,
+                    text=f"⏳ <@{assignee_slack_id}> 延期申請を送信しました。\n希望納期: {self._format_datetime(requested_due)}",
+                )
+            else:
+                # フォールバック: DM送信
+                dm_response = self.client.conversations_open(users=assignee_slack_id)
+                channel_id = dm_response["channel"]["id"]
+                self.client.chat_postMessage(
+                    channel=channel_id,
+                    text="延期申請を送信しました。依頼者の承認をお待ちください。",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"⏳ 延期申請を送信しました。\n希望納期: {self._format_datetime(requested_due)}",
+                            },
+                        }
+                    ],
+                )
         except SlackApiError as e:
             print(f"Error notifying submitter about extension request: {e}")
 
@@ -865,37 +893,37 @@ class SlackService:
         snapshot,
         new_due: datetime,
     ) -> None:
-        message = f"✅ 延期が承認されました。新しい納期: {self._format_datetime(new_due)}"
+        """延期承認通知（スレッド返信、メンション付き）"""
         try:
-            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
-            self.client.chat_postMessage(
-                channel=assignee_dm["channel"]["id"],
-                text=message,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"✅ *延期承認*\nタスク: {snapshot.title}\n新しい納期: {self._format_datetime(new_due)}",
-                        },
-                    }
-                ],
-            )
+            # 担当者スレッドに通知
+            if snapshot.assignee_thread_channel and snapshot.assignee_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.assignee_thread_channel,
+                    thread_ts=snapshot.assignee_thread_ts,
+                    text=f"✅ <@{assignee_slack_id}> 延期が承認されました。\n新しい納期: {self._format_datetime(new_due)}",
+                )
+            else:
+                # フォールバック: DM
+                assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+                self.client.chat_postMessage(
+                    channel=assignee_dm["channel"]["id"],
+                    text=f"✅ 延期が承認されました。\nタスク: {snapshot.title}\n新しい納期: {self._format_datetime(new_due)}",
+                )
 
-            requester_dm = self.client.conversations_open(users=requester_slack_id)
-            self.client.chat_postMessage(
-                channel=requester_dm["channel"]["id"],
-                text=message,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"✅ 延期申請を承認しました。\nタスク: {snapshot.title}\n新しい納期: {self._format_datetime(new_due)}",
-                        },
-                    }
-                ],
-            )
+            # 依頼者スレッドに通知
+            if snapshot.requester_thread_channel and snapshot.requester_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.requester_thread_channel,
+                    thread_ts=snapshot.requester_thread_ts,
+                    text=f"✅ <@{requester_slack_id}> 延期申請を承認しました。\n新しい納期: {self._format_datetime(new_due)}",
+                )
+            else:
+                # フォールバック: DM
+                requester_dm = self.client.conversations_open(users=requester_slack_id)
+                self.client.chat_postMessage(
+                    channel=requester_dm["channel"]["id"],
+                    text=f"✅ 延期申請を承認しました。\nタスク: {snapshot.title}\n新しい納期: {self._format_datetime(new_due)}",
+                )
         except SlackApiError as e:
             print(f"Error notifying extension approval: {e}")
 
@@ -906,38 +934,38 @@ class SlackService:
         snapshot,
         reason: Optional[str] = None,
     ) -> None:
-        rejection_text = "延期申請は却下されました。"
+        """延期却下通知（スレッド返信、メンション付き）"""
         detail = reason or "理由は依頼者に確認してください。"
         try:
-            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
-            self.client.chat_postMessage(
-                channel=assignee_dm["channel"]["id"],
-                text=rejection_text,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"⚠️ *延期却下*\nタスク: {snapshot.title}\n理由: {detail}",
-                        },
-                    }
-                ],
-            )
+            # 担当者スレッドに通知
+            if snapshot.assignee_thread_channel and snapshot.assignee_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.assignee_thread_channel,
+                    thread_ts=snapshot.assignee_thread_ts,
+                    text=f"⚠️ <@{assignee_slack_id}> 延期申請は却下されました。\n理由: {detail}",
+                )
+            else:
+                # フォールバック: DM
+                assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+                self.client.chat_postMessage(
+                    channel=assignee_dm["channel"]["id"],
+                    text=f"⚠️ 延期申請は却下されました。\nタスク: {snapshot.title}\n理由: {detail}",
+                )
 
-            requester_dm = self.client.conversations_open(users=requester_slack_id)
-            self.client.chat_postMessage(
-                channel=requester_dm["channel"]["id"],
-                text=rejection_text,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"⚠️ 延期申請を却下しました。必要であればメンションで共有してください。",
-                        },
-                    }
-                ],
-            )
+            # 依頼者スレッドに通知
+            if snapshot.requester_thread_channel and snapshot.requester_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.requester_thread_channel,
+                    thread_ts=snapshot.requester_thread_ts,
+                    text=f"⚠️ <@{requester_slack_id}> 延期申請を却下しました。",
+                )
+            else:
+                # フォールバック: DM
+                requester_dm = self.client.conversations_open(users=requester_slack_id)
+                self.client.chat_postMessage(
+                    channel=requester_dm["channel"]["id"],
+                    text=f"⚠️ 延期申請を却下しました。必要であればメンションで共有してください。",
+                )
         except SlackApiError as e:
             print(f"Error notifying extension rejection: {e}")
 
@@ -1077,11 +1105,11 @@ class SlackService:
                 }
             )
 
-            # スレッドで送信
+            # スレッドで送信（メンション付き）
             return self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
-                text=f"完了承認リクエスト: {snapshot.title}",
+                text=f"<@{requester_slack_id}> 完了承認リクエスト: {snapshot.title}",
                 thread_ts=thread_ts,
             )
         except SlackApiError as e:
@@ -1091,13 +1119,25 @@ class SlackService:
     async def notify_completion_request_submitted(
         self,
         assignee_slack_id: str,
+        thread_channel: Optional[str] = None,
+        thread_ts: Optional[str] = None,
     ) -> None:
+        """完了申請送信完了通知（スレッド返信）"""
         try:
-            dm = self.client.conversations_open(users=assignee_slack_id)
-            self.client.chat_postMessage(
-                channel=dm["channel"]["id"],
-                text="完了承認を依頼者に送信しました。承認をお待ちください。",
-            )
+            # スレッド情報があればスレッドに返信、なければDM
+            if thread_channel and thread_ts:
+                self.client.chat_postMessage(
+                    channel=thread_channel,
+                    thread_ts=thread_ts,
+                    text=f"✅ <@{assignee_slack_id}> 完了承認を依頼者に送信しました。承認をお待ちください。",
+                )
+            else:
+                # フォールバック: DM送信
+                dm = self.client.conversations_open(users=assignee_slack_id)
+                self.client.chat_postMessage(
+                    channel=dm["channel"]["id"],
+                    text="完了承認を依頼者に送信しました。承認をお待ちください。",
+                )
         except SlackApiError as e:
             print(f"Error notifying submitter of completion request: {e}")
 
@@ -1108,38 +1148,39 @@ class SlackService:
         snapshot,
         approval_time: datetime,
     ) -> None:
-        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
-        message = f"✅ 完了が承認されました ({self._format_datetime(approval_time)})"
+        """完了承認通知（スレッド返信、メンション付き）"""
         try:
-            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
-            self.client.chat_postMessage(
-                channel=assignee_dm["channel"]["id"],
-                text=message,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"✅ *完了承認*\nタスク: <{notion_url}|{snapshot.title}>\n承認日時: {self._format_datetime(approval_time)}",
-                        },
-                    }
-                ],
-            )
+            # 担当者スレッドに通知
+            if snapshot.assignee_thread_channel and snapshot.assignee_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.assignee_thread_channel,
+                    thread_ts=snapshot.assignee_thread_ts,
+                    text=f"✅ <@{assignee_slack_id}> 完了が承認されました ({self._format_datetime(approval_time)})",
+                )
+            else:
+                # フォールバック: DM
+                notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+                assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+                self.client.chat_postMessage(
+                    channel=assignee_dm["channel"]["id"],
+                    text=f"✅ 完了が承認されました\nタスク: <{notion_url}|{snapshot.title}>\n承認日時: {self._format_datetime(approval_time)}",
+                )
 
-            requester_dm = self.client.conversations_open(users=requester_slack_id)
-            self.client.chat_postMessage(
-                channel=requester_dm["channel"]["id"],
-                text=message,
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"✅ 完了を承認しました。\nタスク: <{notion_url}|{snapshot.title}>\n承認日時: {self._format_datetime(approval_time)}",
-                        },
-                    }
-                ],
-            )
+            # 依頼者スレッドに通知
+            if snapshot.requester_thread_channel and snapshot.requester_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.requester_thread_channel,
+                    thread_ts=snapshot.requester_thread_ts,
+                    text=f"✅ <@{requester_slack_id}> 完了を承認しました ({self._format_datetime(approval_time)})",
+                )
+            else:
+                # フォールバック: DM
+                notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+                requester_dm = self.client.conversations_open(users=requester_slack_id)
+                self.client.chat_postMessage(
+                    channel=requester_dm["channel"]["id"],
+                    text=f"✅ 完了を承認しました\nタスク: <{notion_url}|{snapshot.title}>\n承認日時: {self._format_datetime(approval_time)}",
+                )
         except SlackApiError as e:
             print(f"Error notifying completion approval: {e}")
 
@@ -1151,37 +1192,39 @@ class SlackService:
         reason: str,
         new_due: datetime,
     ) -> None:
-        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+        """完了却下通知（スレッド返信、メンション付き）"""
         try:
-            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
-            self.client.chat_postMessage(
-                channel=assignee_dm["channel"]["id"],
-                text="⚠️ 完了申請が却下されました。",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"⚠️ *完了却下*\nタスク: <{notion_url}|{snapshot.title}>\n新しい納期: {self._format_datetime(new_due)}\n理由: {reason}",
-                        },
-                    }
-                ],
-            )
+            # 担当者スレッドに通知
+            if snapshot.assignee_thread_channel and snapshot.assignee_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.assignee_thread_channel,
+                    thread_ts=snapshot.assignee_thread_ts,
+                    text=f"⚠️ <@{assignee_slack_id}> 完了申請が却下されました。\n新しい納期: {self._format_datetime(new_due)}\n理由: {reason}",
+                )
+            else:
+                # フォールバック: DM
+                notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+                assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+                self.client.chat_postMessage(
+                    channel=assignee_dm["channel"]["id"],
+                    text=f"⚠️ 完了申請が却下されました\nタスク: <{notion_url}|{snapshot.title}>\n新しい納期: {self._format_datetime(new_due)}\n理由: {reason}",
+                )
 
-            requester_dm = self.client.conversations_open(users=requester_slack_id)
-            self.client.chat_postMessage(
-                channel=requester_dm["channel"]["id"],
-                text="⚠️ 完了申請を却下しました。",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"⚠️ 完了申請を却下しました。\nタスク: <{notion_url}|{snapshot.title}>\n新しい納期: {self._format_datetime(new_due)}\n理由: {reason}",
-                        },
-                    }
-                ],
-            )
+            # 依頼者スレッドに通知
+            if snapshot.requester_thread_channel and snapshot.requester_thread_ts:
+                self.client.chat_postMessage(
+                    channel=snapshot.requester_thread_channel,
+                    thread_ts=snapshot.requester_thread_ts,
+                    text=f"⚠️ <@{requester_slack_id}> 完了申請を却下しました。\n新しい納期: {self._format_datetime(new_due)}",
+                )
+            else:
+                # フォールバック: DM
+                notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+                requester_dm = self.client.conversations_open(users=requester_slack_id)
+                self.client.chat_postMessage(
+                    channel=requester_dm["channel"]["id"],
+                    text=f"⚠️ 完了申請を却下しました\nタスク: <{notion_url}|{snapshot.title}>\n新しい納期: {self._format_datetime(new_due)}\n理由: {reason}",
+                )
         except SlackApiError as e:
             print(f"Error notifying completion rejection: {e}")
 
@@ -1200,11 +1243,15 @@ class SlackService:
 
         # 担当者（承認者）への通知
         try:
-            if assignee_thread_channel:
+            # スレッド情報が両方揃っている場合のみスレッド送信
+            if assignee_thread_channel and assignee_thread_ts:
                 assignee_channel_id = assignee_thread_channel
+                assignee_thread = assignee_thread_ts
             else:
+                # フォールバック: DM送信（スレッドなし）
                 assignee_dm = self.client.conversations_open(users=assignee_slack_id)
                 assignee_channel_id = assignee_dm["channel"]["id"]
+                assignee_thread = None
 
             assignee_blocks = [
                 {
@@ -1216,23 +1263,27 @@ class SlackService:
                 },
             ]
 
-            # スレッド返信として送信
+            # スレッド返信として送信（thread_tsがNoneの場合は新規メッセージ）
             self._send_message_with_thread(
                 channel=assignee_channel_id,
                 blocks=assignee_blocks,
-                text="@タスク承認待ちリマインド",
-                thread_ts=assignee_thread_ts,
+                text=f"<@{assignee_slack_id}> タスク承認待ちリマインド",
+                thread_ts=assignee_thread,
             )
         except SlackApiError as e:
             print(f"Error sending task approval reminder to assignee: {e}")
 
         # 依頼者への通知
         try:
-            if requester_thread_channel:
+            # スレッド情報が両方揃っている場合のみスレッド送信
+            if requester_thread_channel and requester_thread_ts:
                 requester_channel_id = requester_thread_channel
+                requester_thread = requester_thread_ts
             else:
+                # フォールバック: DM送信（スレッドなし）
                 requester_dm = self.client.conversations_open(users=requester_slack_id)
                 requester_channel_id = requester_dm["channel"]["id"]
+                requester_thread = None
 
             requester_blocks = [
                 {
@@ -1244,12 +1295,12 @@ class SlackService:
                 },
             ]
 
-            # スレッド返信として送信
+            # スレッド返信として送信（thread_tsがNoneの場合は新規メッセージ）
             return self._send_message_with_thread(
                 channel=requester_channel_id,
                 blocks=requester_blocks,
-                text="@タスク承認待ち",
-                thread_ts=requester_thread_ts,
+                text=f"<@{requester_slack_id}> タスク承認待ち",
+                thread_ts=requester_thread,
             )
         except SlackApiError as e:
             print(f"Error sending task approval reminder to requester: {e}")
@@ -1270,11 +1321,15 @@ class SlackService:
 
         # 依頼者（承認者）への通知
         try:
-            if requester_thread_channel:
+            # スレッド情報が両方揃っている場合のみスレッド送信
+            if requester_thread_channel and requester_thread_ts:
                 requester_channel_id = requester_thread_channel
+                requester_thread = requester_thread_ts
             else:
+                # フォールバック: DM送信（スレッドなし）
                 requester_dm = self.client.conversations_open(users=requester_slack_id)
                 requester_channel_id = requester_dm["channel"]["id"]
+                requester_thread = None
 
             requester_blocks = [
                 {
@@ -1286,23 +1341,27 @@ class SlackService:
                 },
             ]
 
-            # スレッド返信として送信
+            # スレッド返信として送信（thread_tsがNoneの場合は新規メッセージ）
             self._send_message_with_thread(
                 channel=requester_channel_id,
                 blocks=requester_blocks,
-                text="@完了承認待ちリマインド",
-                thread_ts=requester_thread_ts,
+                text=f"<@{requester_slack_id}> 完了承認待ちリマインド",
+                thread_ts=requester_thread,
             )
         except SlackApiError as e:
             print(f"Error sending completion approval reminder to requester: {e}")
 
         # 担当者への通知
         try:
-            if assignee_thread_channel:
+            # スレッド情報が両方揃っている場合のみスレッド送信
+            if assignee_thread_channel and assignee_thread_ts:
                 assignee_channel_id = assignee_thread_channel
+                assignee_thread = assignee_thread_ts
             else:
+                # フォールバック: DM送信（スレッドなし）
                 assignee_dm = self.client.conversations_open(users=assignee_slack_id)
                 assignee_channel_id = assignee_dm["channel"]["id"]
+                assignee_thread = None
 
             assignee_blocks = [
                 {
@@ -1314,12 +1373,12 @@ class SlackService:
                 },
             ]
 
-            # スレッド返信として送信
+            # スレッド返信として送信（thread_tsがNoneの場合は新規メッセージ）
             return self._send_message_with_thread(
                 channel=assignee_channel_id,
                 blocks=assignee_blocks,
-                text="@完了承認待ち",
-                thread_ts=assignee_thread_ts,
+                text=f"<@{assignee_slack_id}> 完了承認待ち",
+                thread_ts=assignee_thread,
             )
         except SlackApiError as e:
             print(f"Error sending completion approval reminder to assignee: {e}")
@@ -1342,11 +1401,15 @@ class SlackService:
 
         # 依頼者（承認者）への通知
         try:
-            if requester_thread_channel:
+            # スレッド情報が両方揃っている場合のみスレッド送信
+            if requester_thread_channel and requester_thread_ts:
                 requester_channel_id = requester_thread_channel
+                requester_thread = requester_thread_ts
             else:
+                # フォールバック: DM送信（スレッドなし）
                 requester_dm = self.client.conversations_open(users=requester_slack_id)
                 requester_channel_id = requester_dm["channel"]["id"]
+                requester_thread = None
 
             requester_blocks = [
                 {
@@ -1358,23 +1421,27 @@ class SlackService:
                 },
             ]
 
-            # スレッド返信として送信
+            # スレッド返信として送信（thread_tsがNoneの場合は新規メッセージ）
             self._send_message_with_thread(
                 channel=requester_channel_id,
                 blocks=requester_blocks,
-                text="@延期承認待ちリマインド",
-                thread_ts=requester_thread_ts,
+                text=f"<@{requester_slack_id}> 延期承認待ちリマインド",
+                thread_ts=requester_thread,
             )
         except SlackApiError as e:
             print(f"Error sending extension approval reminder to requester: {e}")
 
         # 担当者への通知
         try:
-            if assignee_thread_channel:
+            # スレッド情報が両方揃っている場合のみスレッド送信
+            if assignee_thread_channel and assignee_thread_ts:
                 assignee_channel_id = assignee_thread_channel
+                assignee_thread = assignee_thread_ts
             else:
+                # フォールバック: DM送信（スレッドなし）
                 assignee_dm = self.client.conversations_open(users=assignee_slack_id)
                 assignee_channel_id = assignee_dm["channel"]["id"]
+                assignee_thread = None
 
             assignee_blocks = [
                 {
@@ -1386,12 +1453,12 @@ class SlackService:
                 },
             ]
 
-            # スレッド返信として送信
+            # スレッド返信として送信（thread_tsがNoneの場合は新規メッセージ）
             return self._send_message_with_thread(
                 channel=assignee_channel_id,
                 blocks=assignee_blocks,
-                text="@延期承認待ち",
-                thread_ts=assignee_thread_ts,
+                text=f"<@{assignee_slack_id}> 延期承認待ち",
+                thread_ts=assignee_thread,
             )
         except SlackApiError as e:
             print(f"Error sending extension approval reminder to assignee: {e}")

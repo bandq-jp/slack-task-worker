@@ -718,11 +718,19 @@ async def handle_interactive(request: Request):
 
                         if assignee_slack_id:
                             try:
-                                assignee_dm = slack_service.client.conversations_open(users=assignee_slack_id)
-                                slack_service.client.chat_postMessage(
-                                    channel=assignee_dm["channel"]["id"],
-                                    text=f"ℹ️ 依頼者がタスク「{snapshot.title}」を削除しました。",
-                                )
+                                # スレッド情報があればスレッドに通知、なければDM
+                                if snapshot.assignee_thread_channel and snapshot.assignee_thread_ts:
+                                    slack_service.client.chat_postMessage(
+                                        channel=snapshot.assignee_thread_channel,
+                                        thread_ts=snapshot.assignee_thread_ts,
+                                        text=f"ℹ️ <@{assignee_slack_id}> 依頼者がタスク「{snapshot.title}」を削除しました。",
+                                    )
+                                else:
+                                    assignee_dm = slack_service.client.conversations_open(users=assignee_slack_id)
+                                    slack_service.client.chat_postMessage(
+                                        channel=assignee_dm["channel"]["id"],
+                                        text=f"ℹ️ 依頼者がタスク「{snapshot.title}」を削除しました。",
+                                    )
                             except Exception as notify_error:
                                 print(f"⚠️ Failed to notify assignee: {notify_error}")
 
@@ -1263,7 +1271,7 @@ async def handle_interactive(request: Request):
                 description_data = None
                 if "description_block" in values and values["description_block"]["description_input"].get("rich_text_value"):
                     description_rich = values["description_block"]["description_input"]["rich_text_value"]
-                    description_data = description_rich
+                    description_data = convert_rich_text_to_plain_text(description_rich)
 
                 # 納期をdatetimeに変換
                 due_date_unix = values["due_date_block"]["due_date_picker"]["selected_date_time"]
@@ -1416,7 +1424,7 @@ async def handle_interactive(request: Request):
             description_data = None
             description_payload = values.get("description_block", {}).get("description_input", {})
             if description_payload.get("rich_text_value"):
-                description_data = description_payload.get("rich_text_value")
+                description_data = convert_rich_text_to_plain_text(description_payload.get("rich_text_value"))
 
             due_date = datetime.fromtimestamp(due_picker["selected_date_time"], tz=timezone.utc).astimezone(JST)
 
@@ -1752,6 +1760,8 @@ async def handle_interactive(request: Request):
                 await slack_service.notify_extension_request_submitted(
                     assignee_slack_id=assignee_slack_id,
                     requested_due=requested_due,
+                    thread_channel=snapshot.assignee_thread_channel,
+                    thread_ts=snapshot.assignee_thread_ts,
                 )
 
             return JSONResponse(content={})
@@ -1846,7 +1856,11 @@ async def handle_interactive(request: Request):
                     )
 
                     if assignee_slack_id:
-                        await slack_service.notify_completion_request_submitted(assignee_slack_id)
+                        await slack_service.notify_completion_request_submitted(
+                            assignee_slack_id,
+                            thread_channel=snapshot.assignee_thread_channel,
+                            thread_ts=snapshot.assignee_thread_ts,
+                        )
 
                     if view_id:
                         try:
