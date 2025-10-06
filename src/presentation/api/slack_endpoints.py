@@ -611,6 +611,111 @@ async def handle_interactive(request: Request):
 
             return JSONResponse(content={})
 
+        elif action_id == "delete_task":
+            try:
+                value_data = json.loads(action.get("value", "{}"))
+            except json.JSONDecodeError:
+                print("⚠️ Invalid payload for delete_task")
+                return JSONResponse(content={})
+
+            page_id = value_data.get("page_id")
+
+            import asyncio
+
+            async def run_delete():
+                try:
+                    # タスクスナップショット取得
+                    snapshot = await notion_service.get_task_snapshot(page_id)
+                    if not snapshot:
+                        raise ValueError("タスクが見つかりません")
+
+                    # 依頼者かチェック
+                    if snapshot.requester_email:
+                        requester_user = await slack_user_repository.find_by_email(Email(snapshot.requester_email))
+                        if requester_user and str(requester_user.user_id) != user_id:
+                            try:
+                                dm = slack_service.client.conversations_open(users=user_id)
+                                slack_service.client.chat_postMessage(
+                                    channel=dm["channel"]["id"],
+                                    text="❌ タスクを削除できるのは依頼者のみです。",
+                                )
+                            except Exception as dm_error:
+                                print(f"⚠️ Failed to notify user about permission error: {dm_error}")
+                            return
+
+                    # タスクを無効化（論理削除）
+                    await notion_service.disable_task(page_id)
+
+                    # 監査ログ記録
+                    user_info = await slack_service.get_user_info(user_id)
+                    actor_email = user_info.get("profile", {}).get("email") if user_info else None
+                    await notion_service.record_audit_log(
+                        task_page_id=page_id,
+                        event_type="タスク削除",
+                        detail=f"依頼者がタスクを削除しました\nタスク: {snapshot.title}",
+                        actor_email=actor_email,
+                    )
+
+                    # 成功メッセージを親メッセージに表示
+                    message = payload.get("message", {})
+                    channel = payload.get("channel", {}).get("id")
+                    message_ts = message.get("ts")
+
+                    if channel and message_ts:
+                        try:
+                            slack_service.client.chat_update(
+                                channel=channel,
+                                ts=message_ts,
+                                text="✅ タスクを削除しました",
+                                blocks=[
+                                    {
+                                        "type": "section",
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": f"✅ *タスクを削除しました*\n\nタスク: {snapshot.title}"
+                                        }
+                                    }
+                                ]
+                            )
+                        except Exception as update_error:
+                            print(f"⚠️ メッセージ更新エラー: {update_error}")
+
+                    # 担当者にも通知
+                    if snapshot.assignee_email:
+                        assignee_slack_id = None
+                        try:
+                            assignee_slack_user = await slack_user_repository.find_by_email(Email(snapshot.assignee_email))
+                            if assignee_slack_user:
+                                assignee_slack_id = str(assignee_slack_user.user_id)
+                        except Exception as lookup_error:
+                            print(f"⚠️ Assignee lookup failed: {lookup_error}")
+
+                        if assignee_slack_id:
+                            try:
+                                # スレッド情報があればスレッドに通知、なければDM
+                                if snapshot.assignee_thread_channel and snapshot.assignee_thread_ts:
+                                    slack_service.client.chat_postMessage(
+                                        channel=snapshot.assignee_thread_channel,
+                                        thread_ts=snapshot.assignee_thread_ts,
+                                        text=f"ℹ️ <@{assignee_slack_id}> 依頼者がタスク「{snapshot.title}」を削除しました。",
+                                    )
+                                else:
+                                    assignee_dm = slack_service.client.conversations_open(users=assignee_slack_id)
+                                    slack_service.client.chat_postMessage(
+                                        channel=assignee_dm["channel"]["id"],
+                                        text=f"ℹ️ 依頼者がタスク「{snapshot.title}」を削除しました。",
+                                    )
+                            except Exception as notify_error:
+                                print(f"⚠️ Failed to notify assignee: {notify_error}")
+
+                except Exception as e:
+                    print(f"❌ タスク削除エラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            asyncio.create_task(run_delete())
+            return JSONResponse(content={})
+
         elif action_id == "delete_pending_task":
             try:
                 value_data = json.loads(action.get("value", "{}"))

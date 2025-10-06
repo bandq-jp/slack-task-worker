@@ -290,13 +290,6 @@ class SlackService:
                 "elements": [
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "👀 既読", "emoji": True},
-                        "style": "primary",
-                        "action_id": "mark_reminder_read",
-                        "value": json.dumps({"page_id": task.notion_page_id}),
-                    },
-                    {
-                        "type": "button",
                         "text": {"type": "plain_text", "text": "⏳ 延期申請", "emoji": True},
                         "action_id": "open_extension_modal",
                         "value": json.dumps({"page_id": task.notion_page_id}),
@@ -383,6 +376,24 @@ class SlackService:
                     "type": "mrkdwn",
                     "text": "✅ *ステータス:* 進行中\nタスクが承認され、Notionに登録されました。",
                 },
+            })
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🗑️ タスク削除", "emoji": True},
+                        "style": "danger",
+                        "action_id": "delete_task",
+                        "value": json.dumps({"page_id": task.notion_page_id}),
+                        "confirm": {
+                            "title": {"type": "plain_text", "text": "タスク削除の確認"},
+                            "text": {"type": "mrkdwn", "text": f"本当に「{task.title}」を削除しますか？\n\n⚠️ この操作は取り消せません。"},
+                            "confirm": {"type": "plain_text", "text": "削除する"},
+                            "deny": {"type": "plain_text", "text": "キャンセル"},
+                        },
+                    }
+                ],
             })
         elif status == TASK_STATUS_REJECTED or status == "差し戻し":
             blocks.append({
@@ -673,8 +684,8 @@ class SlackService:
                 },
             ]
 
-            # 当日リマインドの場合は既読ボタンを追加
-            if stage == "当日":
+            # 当日・超過リマインドの場合は既読ボタンを追加
+            if stage in ["当日", "超過"]:
                 blocks.append(
                     {
                         "type": "actions",
