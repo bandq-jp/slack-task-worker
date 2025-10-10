@@ -10,6 +10,7 @@ from src.application.dto.task_dto import (
     ReviseTaskRequestDto,
 )
 from src.application.services.task_metrics_service import TaskMetricsApplicationService
+from src.application.services.task_event_notification_service import TaskEventNotificationService
 from src.utils.concurrency import ConcurrencyCoordinator
 
 
@@ -24,6 +25,7 @@ class TaskApplicationService:
         notion_service,  # NotionServiceインターフェース
         task_metrics_service: Optional[TaskMetricsApplicationService] = None,
         concurrency_coordinator: Optional[ConcurrencyCoordinator] = None,
+        task_event_notification_service: Optional[TaskEventNotificationService] = None,
     ):
         self.task_repository = task_repository
         self.user_repository = user_repository
@@ -31,6 +33,7 @@ class TaskApplicationService:
         self.notion_service = notion_service
         self.task_metrics_service = task_metrics_service
         self.concurrency = concurrency_coordinator or ConcurrencyCoordinator()
+        self.task_event_notification_service = task_event_notification_service
 
     async def create_task_request(self, dto: CreateTaskRequestDto) -> TaskResponseDto:
         """タスク依頼を作成"""
@@ -250,6 +253,17 @@ class TaskApplicationService:
                 thread_ts=requester_thread_ts,
                 thread_channel=requester_thread_channel,
             )
+
+            if self.task_event_notification_service:
+                try:
+                    await self.task_event_notification_service.notify_task_approved(
+                        task=task,
+                        approval_time=task.updated_at,
+                        requester_name=requester_name,
+                        assignee_name=assignee_name,
+                    )
+                except Exception as notify_error:
+                    print(f"⚠️ Failed to broadcast task approval notification: {notify_error}")
 
         elif dto.action == "reject":
             if not dto.rejection_reason:

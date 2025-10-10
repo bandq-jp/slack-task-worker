@@ -92,6 +92,21 @@ async def handle_completion_approval_action(
             approval_time = datetime.now(JST)
             actor_slack_id = payload.get("user", {}).get("id")
 
+            async def _resolve_display_name(slack_id: Optional[str], fallback: str) -> str:
+                if not slack_id:
+                    return fallback
+                try:
+                    info = await slack_service.get_user_info(slack_id)
+                except Exception:
+                    return fallback
+                return (
+                    info.get("real_name")
+                    or info.get("profile", {}).get("real_name")
+                    or info.get("profile", {}).get("display_name")
+                    or info.get("name")
+                    or fallback
+                )
+
             async with task_concurrency.guard(page_id):
                 snapshot = await notion_service.get_task_snapshot(page_id)
                 if not snapshot:
@@ -177,6 +192,23 @@ async def handle_completion_approval_action(
                     snapshot=display_snapshot,
                     approval_time=approval_time,
                 )
+                notification_service = dependencies.task_event_notification_service
+                if notification_service:
+                    requester_name = await _resolve_display_name(requester_slack_id, "依頼者")
+                    assignee_name = await _resolve_display_name(assignee_slack_id, "担当者")
+                    try:
+                        await notification_service.notify_completion_approved(
+                            notion_page_id=display_snapshot.page_id,
+                            title=display_snapshot.title,
+                            due_date=display_snapshot.due_date,
+                            approval_time=approval_time,
+                            requester_slack_id=requester_slack_id or "",
+                            requester_name=requester_name,
+                            assignee_slack_id=assignee_slack_id or "",
+                            assignee_name=assignee_name,
+                        )
+                    except Exception as notify_error:
+                        print(f"⚠️ Failed to broadcast completion approval notification: {notify_error}")
 
             slack_service.update_modal_message(
                 view_id=modal_id,

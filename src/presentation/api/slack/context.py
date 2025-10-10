@@ -13,6 +13,7 @@ from src.infrastructure.repositories.calendar_task_repository_impl import Google
 from src.application.services.user_mapping_service import UserMappingApplicationService
 from src.domain.services.user_mapping_domain_service import UserMappingDomainService
 from src.application.services.task_service import TaskApplicationService
+from src.application.services.task_event_notification_service import TaskEventNotificationService
 from src.application.services.task_metrics_service import TaskMetricsApplicationService
 from src.application.services.calendar_task_service import CalendarTaskApplicationService
 from src.services.ai_service import TaskAIService
@@ -33,6 +34,7 @@ class SlackDependencies:
     task_service: TaskApplicationService
     admin_metrics_service: AdminMetricsNotionService
     task_metrics_service: TaskMetricsApplicationService
+    task_event_notification_service: Optional[TaskEventNotificationService]
     calendar_task_service: Optional[CalendarTaskApplicationService]
     ai_service: Optional[TaskAIService]
     task_concurrency: ConcurrencyCoordinator
@@ -56,6 +58,16 @@ def build_slack_dependencies() -> SlackDependencies:
         notion_user_repository=notion_user_repository,
         slack_user_repository=slack_user_repository,
         mapping_domain_service=mapping_domain_service,
+    )
+    task_event_notification_service_instance = TaskEventNotificationService(
+        slack_service=slack_service,
+        slack_user_repository=slack_user_repository,
+        notification_emails=settings.task_event_notification_emails or [],
+    )
+    task_event_notification_service = (
+        task_event_notification_service_instance
+        if task_event_notification_service_instance.enabled
+        else None
     )
 
     notion_service = DynamicNotionService(
@@ -92,6 +104,7 @@ def build_slack_dependencies() -> SlackDependencies:
         notion_service=notion_service,
         task_metrics_service=task_metrics_service,
         concurrency_coordinator=task_concurrency,
+        task_event_notification_service=task_event_notification_service,
     )
 
     calendar_task_service: Optional[CalendarTaskApplicationService] = None
@@ -122,6 +135,7 @@ def build_slack_dependencies() -> SlackDependencies:
         task_service=task_service,
         admin_metrics_service=admin_metrics_service,
         task_metrics_service=task_metrics_service,
+        task_event_notification_service=task_event_notification_service,
         calendar_task_service=calendar_task_service,
         ai_service=ai_service,
         task_concurrency=task_concurrency,
