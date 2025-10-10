@@ -527,6 +527,9 @@ class DynamicNotionService:
                         "start": now.isoformat(),
                     },
                 },
+                TASK_PROP_APPROVAL_REMINDER_AT: {
+                    "date": None,
+                },
             }
 
             # 依頼者プロパティ（Peopleタイプ）
@@ -1161,6 +1164,9 @@ class DynamicNotionService:
             TASK_PROP_EXTENSION_REQUESTED_AT: {
                 "date": {"start": self._format_datetime(now)},
             },
+            TASK_PROP_APPROVAL_REMINDER_AT: {
+                "date": None,
+            },
         }
 
         try:
@@ -1257,6 +1263,9 @@ class DynamicNotionService:
             },
             TASK_PROP_LAST_READ_AT: {
                 "date": {"start": self._format_datetime(request_time)},
+            },
+            TASK_PROP_APPROVAL_REMINDER_AT: {
+                "date": None,
             },
         }
 
@@ -1596,6 +1605,9 @@ class DynamicNotionService:
             },
             TASK_PROP_COMPLETION_REJECT_REASON: {
                 "rich_text": [],
+            },
+            TASK_PROP_APPROVAL_REMINDER_AT: {
+                "date": None,
             },
         }
 

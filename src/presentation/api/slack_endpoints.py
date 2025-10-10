@@ -271,6 +271,10 @@ async def run_reminders():
 
                 # 前回リマインド送信からも6時間経過しているか確認
                 last_reminder = snapshot.approval_reminder_last_sent_at
+                if last_reminder and start_time and last_reminder < start_time:
+                    print("     ⚠️ 承認種別が切り替わったためリマインド履歴をリセットします")
+                    last_reminder = None
+
                 should_send_reminder = hours_elapsed >= APPROVAL_REMINDER_THRESHOLD_HOURS
 
                 if last_reminder:
@@ -287,9 +291,15 @@ async def run_reminders():
                 assignee_slack_id = await resolve_slack_id(snapshot.assignee_email)
                 requester_slack_id = await resolve_slack_id(snapshot.requester_email)
 
-                if not assignee_slack_id or not requester_slack_id:
-                    approval_errors.append(f"user_missing:{snapshot.page_id}")
-                    continue
+                # リマインドの送信先となるユーザーが解決できているかチェック
+                if approval_type == "task_approval":
+                    if not assignee_slack_id:
+                        approval_errors.append(f"user_missing:{snapshot.page_id}:{approval_type}")
+                        continue
+                else:
+                    if not requester_slack_id:
+                        approval_errors.append(f"requester_missing:{snapshot.page_id}:{approval_type}")
+                        continue
 
                 # 承認待ち種別に応じてリマインド送信
                 if approval_type == "task_approval":
