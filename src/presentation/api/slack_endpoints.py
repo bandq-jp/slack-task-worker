@@ -38,6 +38,7 @@ from src.presentation.api.slack.actions import (
     handle_extension_request_submission,
     handle_approve_extension_action,
     handle_reject_extension_action,
+    handle_completion_approval_action,
 )
 from zoneinfo import ZoneInfo
 
@@ -912,102 +913,17 @@ async def handle_interactive(request: Request):
                 print("⚠️ Invalid payload for approve_completion_request")
                 return JSONResponse(content={})
 
-            page_id = value_data.get("page_id")
-            assignee_slack_id = value_data.get("assignee_slack_id")
-            requester_slack_id = value_data.get("requester_slack_id", user_id)
-            channel_id = payload.get("channel", {}).get("id")
-            message = payload.get("message", {})
-            message_ts = message.get("ts")
-            message_blocks = message.get("blocks", [])
-
-            import asyncio
-
-            async def run_completion_approval():
-                if not page_id:
-                    return
-                try:
-                    snapshot = await notion_service.get_task_snapshot(page_id)
-                    if not snapshot:
-                        slack_service.client.chat_postMessage(
-                            channel=slack_service.client.conversations_open(users=user_id)["channel"]["id"],
-                            text="Notionのタスク情報を取得できず承認できませんでした。",
-                        )
-                        return
-
-                    approval_time = datetime.now(JST)
-                    requested_before_due = _requested_on_time(
-                        snapshot.completion_requested_at if snapshot else None,
-                        snapshot.due_date if snapshot else None,
-                    )
-                    eligible_for_overdue_points = getattr(snapshot, "status", None) == TASK_STATUS_APPROVED
-
-                    await notion_service.approve_completion(
-                        page_id,
-                        approval_time,
-                        requested_before_due,
-                    )
-                    await notion_service.update_task_status(page_id, "completed")
-
-                    user_info = await slack_service.get_user_info(user_id)
-                    actor_email = user_info.get("profile", {}).get("email") if user_info else None
-                    await notion_service.record_audit_log(
-                        task_page_id=page_id,
-                        event_type="完了承認",
-                        detail=f"完了承認 {approval_time.astimezone().strftime('%Y-%m-%d %H:%M')}",
-                        actor_email=actor_email,
-                    )
-
-                    if channel_id and message_ts and message_blocks:
-                        try:
-                            updated_blocks = _replace_actions_with_context(
-                                message_blocks,
-                                f"✅ 完了を承認しました ({_format_datetime_text(datetime.now(JST))})",
-                            )
-                            slack_service.client.chat_update(
-                                channel=channel_id,
-                                ts=message_ts,
-                                blocks=updated_blocks,
-                                text="完了を承認しました",
-                            )
-                        except Exception as update_error:
-                            print(f"⚠️ Failed to update completion approval message: {update_error}")
-
-                    await slack_service.notify_completion_approved(
-                        assignee_slack_id=assignee_slack_id,
-                        requester_slack_id=requester_slack_id,
-                        snapshot=snapshot,
-                        approval_time=approval_time,
-                    )
-
-                    target_points = 1 if (eligible_for_overdue_points and not requested_before_due) else 0
-                    refreshed_snapshot = await notion_service.get_task_snapshot(page_id)
-                    snapshot_for_metrics = refreshed_snapshot or snapshot
-
-                    # 延期承認後の納期超過ポイントを即時再判定
-                    try:
-                        now_utc = datetime.now(timezone.utc)
-                        new_due_utc = snapshot_for_metrics.due_date.astimezone(timezone.utc) if snapshot_for_metrics.due_date else None
-                        still_overdue = bool(new_due_utc and new_due_utc <= now_utc)
-                        eligible_status = getattr(snapshot_for_metrics, "status", None) == TASK_STATUS_APPROVED
-                        target_points = 1 if (still_overdue and eligible_status) else 0
-                        # 変更がある場合のみ更新
-                        metrics = await task_metrics_service.admin_metrics_service.get_metrics_by_task_id(page_id)
-                        current_points = metrics.overdue_points if metrics else 0
-                        if current_points != target_points:
-                            await task_metrics_service.update_overdue_points(page_id, target_points)
-                    except Exception as pts_err:
-                        print(f"⚠️ Failed to update overdue points after extension approval: {pts_err}")
-                    await task_metrics_service.sync_snapshot(
-                        snapshot_for_metrics,
-                        overdue_points=target_points,
-                    )
-                    await task_metrics_service.refresh_assignee_summaries()
-
-                except Exception as approval_error:
-                    print(f"⚠️ Completion approval failed: {approval_error}")
-
-            asyncio.create_task(run_completion_approval())
-            return JSONResponse(content={})
+            return await handle_completion_approval_action(
+                payload=payload,
+                dependencies=dependencies,
+                trigger_id=trigger_id,
+                page_id=value_data.get("page_id"),
+                assignee_slack_id=value_data.get("assignee_slack_id"),
+                requester_slack_id=value_data.get("requester_slack_id", user_id),
+                channel_id=payload.get("channel", {}).get("id"),
+                message_ts=payload.get("message", {}).get("ts"),
+                message_blocks=payload.get("message", {}).get("blocks", []),
+            )
 
         elif action_id == "reject_completion_request":
             try:

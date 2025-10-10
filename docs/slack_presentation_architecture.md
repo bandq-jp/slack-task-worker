@@ -11,6 +11,8 @@
   - タスク情報がメモリに存在しない場合でも、Notion スナップショットと Slack メール検索から復元して処理を継続。
 - `src/presentation/api/slack/actions/extension_actions.py`
   - 延期申請モーダルの送信に加え、承認／却下ボタンの処理も担当。すべてのフローでローディングモーダル → 完了メッセージの流れを統一。
+- `src/presentation/api/slack/actions/completion_actions.py`
+  - 完了承認ボタンの処理を担当。申請承認前後でモーダルを更新し、Notionステータス更新・監査ログ・メトリクス反映・Slack通知を一括で実行。
 - `src/presentation/api/slack_endpoints.py`
   - ルーター初期化とルーティングの割当のみを担当し、実際の処理は各モジュールへ委譲。
 
