@@ -47,7 +47,7 @@ class TaskEventNotificationService:
         due_text = self._format_datetime(task.due_date)
         approval_text = self._format_datetime(approval_time)
 
-        header_text = "✅ *タスクが承認されました*"
+        header_text = "✅ *【通知】タスクが発生しました*"
         if notion_url:
             task_line = f"<{notion_url}|{task.title}>"
         else:
@@ -75,12 +75,12 @@ class TaskEventNotificationService:
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": f"承認日時: {approval_text}"},
+                    {"type": "mrkdwn", "text": f"発生日時: {approval_text}"},
                 ],
             },
         ]
 
-        text = f"タスク承認: {task.title}"
+        text = f"[通知] タスクが発生: {task.title}"
         await self._broadcast(text=text, blocks=blocks)
 
     async def notify_completion_approved(
@@ -104,8 +104,7 @@ class TaskEventNotificationService:
         approval_text = self._format_datetime(approval_time)
         overdue_flag, overdue_label = self._completion_due_status(due_date, approval_time)
 
-        header_prefix = "🏁"
-        status_line = f"*完了承認 ({overdue_label})*"
+        header_text = "🏁 *【通知】タスクが完了しました*"
 
         if notion_url:
             task_line = f"<{notion_url}|{title}>"
@@ -139,12 +138,12 @@ class TaskEventNotificationService:
         blocks = [
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"{header_prefix} {status_line}"},
+                "text": {"type": "mrkdwn", "text": header_text},
             },
             {"type": "section", "fields": fields},
         ]
 
-        text = f"タスク完了承認: {title} ({overdue_flag})"
+        text = f"[通知] タスクが完了: {title} ({overdue_flag})"
         await self._broadcast(text=text, blocks=blocks)
 
     def _normalize_emails(self, raw_emails: Sequence[str]) -> List[Email]:
