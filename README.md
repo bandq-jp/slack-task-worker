@@ -12,6 +12,8 @@ SlackからNotionへのタスク管理システム。DDD/Clean Architectureを�
 - 依頼先の完了報告 → 依頼者承認フローでタスク完了を確定
 - ゲストユーザー対応の高速ユーザーマッピング
 - 承認・差し戻し時にNotionのステータス更新
+- 高負荷時の競合を防ぐための排他制御仕組み（詳しくは `docs/concurrency_overview.md` 参照）
+- Slackプレゼンテーション層はモジュール分割され、承認ボタン押下時には処理中モーダルを表示（`docs/slack_presentation_architecture.md`）
 
 ## 📁 プロジェクト構造
 
@@ -153,6 +155,50 @@ python admin/setup_user_mapping.py
 python admin/update_user_mapping.py
 ```
 
+### ローカルでのリマインドテスト
+
+アプリケーションを起動した状態で、別のターミナルから以下のコマンドでリマインド機能をテストできます：
+
+```bash
+# 1. アプリケーションを起動
+uv run main.py
+
+# 2. 別のターミナルでリマインドエンドポイントを手動実行
+curl -X POST http://localhost:8000/slack/cron/run-reminders \
+  -H "Content-Type: application/json" \
+  -d '{"source": "manual"}'
+```
+
+**レスポンスの見方**:
+```json
+{
+  "timestamp": "2025-01-10T12:00:00Z",
+  "checked": 50,                    // 納期リマインド対象タスク数
+  "notified": 5,                    // 納期リマインド送信数
+  "notifications": [...],           // 納期リマインド詳細
+  "errors": [],                     // 納期リマインドエラー
+  "approval_checked": 12,           // 承認待ちタスク数
+  "approval_notified": 3,           // 承認待ちリマインド送信数（6時間経過のみ）
+  "approval_notifications": [       // 承認待ちリマインド詳細
+    {
+      "page_id": "abc123",
+      "approval_type": "task_approval",  // タスク承認待ち
+      "hours_elapsed": 7.5               // 経過時間
+    }
+  ],
+  "approval_errors": []             // 承認待ちリマインドエラー
+}
+```
+
+**承認待ちリマインドの種類**:
+- `task_approval`: タスク依頼の承認待ち（6時間経過でリマインド）
+- `completion_approval`: 完了申請の承認待ち（6時間経過でリマインド）
+- `extension_approval`: 延期申請の承認待ち（6時間経過でリマインド）
+
+**テストのコツ**:
+- 承認待ちリマインドは6時間経過してから送信されるため、テストするにはNotionで `created_time` や `完了申請日時` を6時間以上前に手動で変更する必要があります
+- または、コード内の `APPROVAL_REMINDER_THRESHOLD_HOURS = 6` を一時的に小さい値（例: 0.1）に変更してテストすることもできます
+
 ### トラブルシューティング
 
 - **Slackコマンドが動かない**: [docs/SLACK_TROUBLESHOOTING.md](docs/SLACK_TROUBLESHOOTING.md)
@@ -194,12 +240,26 @@ gcloud scheduler jobs create http task-reminder-hourly \
 3. ローカル検証中は Cloud Scheduler の代わりに以下を叩いて挙動を確認できます。
 
 ```bash
+# 納期リマインド + 承認待ちリマインドを実行（統合エンドポイント）
 curl -X POST http://localhost:8000/slack/cron/run-reminders \
   -H "Content-Type: application/json" \
   -d '{"source": "manual"}'
+
+# レスポンス例:
+# {
+#   "timestamp": "2025-01-10T12:00:00Z",
+#   "checked": 50,                    # 納期リマインド対象タスク数
+#   "notified": 5,                    # 納期リマインド送信数
+#   "notifications": [...],
+#   "errors": [],
+#   "approval_checked": 12,           # 承認待ちタスク数
+#   "approval_notified": 3,           # 承認待ちリマインド送信数
+#   "approval_notifications": [...],
+#   "approval_errors": []
+# }
 ```
 
-4. Cloud Runのログで `checked` / `notified` 件数を確認し、Slackにリマインドが届くことを確認する。
+4. Cloud Runのログで `checked` / `notified` / `approval_checked` / `approval_notified` 件数を確認し、Slackにリマインドが届くことを確認する。
 5. 依頼先がリマインド内の「完了」を押すと、依頼者へNotionリンク付きで承認/却下ボタンが届きます。承認が完了するまではリマインドが停止し、完了承認が遅れても納期超過ポイントは発生しません。
 6. 完了却下時は理由と新しい納期を入力してもらい、その値がNotionと監査ログに反映されます。
 7. 延期が承認された場合はNotionの納期が更新されるため、次回以降のリマインドは自動的に新期日を基準に計算されます。

@@ -61,6 +61,16 @@ TASK_PROP_COMPLETION_APPROVED_AT = "完了承認日時"
 TASK_PROP_COMPLETION_NOTE = "完了報告メモ"
 TASK_PROP_COMPLETION_REJECT_REASON = "完了却下理由"
 
+TASK_PROP_APPROVAL_REMINDER_AT = "承認リマインド最終送信日時"
+TASK_PROP_EXTENSION_REQUESTED_AT = "延期申請日時"
+TASK_PROP_TASK_APPROVAL_REQUESTED_AT = "タスク承認開始日時"
+
+# Slackスレッド管理用プロパティ
+TASK_PROP_ASSIGNEE_THREAD_TS = "依頼先スレッドTS"
+TASK_PROP_ASSIGNEE_THREAD_CHANNEL = "依頼先スレッドチャンネル"
+TASK_PROP_REQUESTER_THREAD_TS = "依頼者スレッドTS"
+TASK_PROP_REQUESTER_THREAD_CHANNEL = "依頼者スレッドチャンネル"
+
 AUDIT_PROP_TITLE = "イベント"
 AUDIT_PROP_EVENT_TYPE = "種別"
 AUDIT_PROP_TASK_RELATION = "関連タスク"
@@ -95,6 +105,15 @@ class NotionTaskSnapshot:
     completion_note: Optional[str]
     completion_approved_at: Optional[datetime]
     completion_reject_reason: Optional[str]
+    created_time: Optional[datetime]
+    approval_reminder_last_sent_at: Optional[datetime]
+    extension_requested_at: Optional[datetime]
+    task_approval_requested_at: Optional[datetime]
+    # Slackスレッド管理用
+    assignee_thread_ts: Optional[str]
+    assignee_thread_channel: Optional[str]
+    requester_thread_ts: Optional[str]
+    requester_thread_channel: Optional[str]
 
 
 class DynamicNotionService:
@@ -130,6 +149,16 @@ class DynamicNotionService:
             normalized = start.replace("Z", "+00:00")
             return datetime.fromisoformat(normalized)
         except ValueError:
+            return None
+
+    def _parse_datetime_string(self, datetime_str: Optional[str]) -> Optional[datetime]:
+        """文字列形式の日時をパースする（created_time等のシステムプロパティ用）"""
+        if not datetime_str:
+            return None
+        try:
+            normalized = datetime_str.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized)
+        except (ValueError, AttributeError):
             return None
 
     def _format_datetime(self, value: datetime) -> str:
@@ -444,6 +473,9 @@ class DynamicNotionService:
                 assignee_email
             )
 
+            # 現在日時（タスク承認開始日時として使用）
+            now = datetime.now(timezone.utc)
+
             # Notionページのプロパティを構築（詳細はページ本文に記載）
             properties = {
                 TASK_PROP_TITLE: {
@@ -489,6 +521,14 @@ class DynamicNotionService:
                 },
                 TASK_PROP_COMPLETION_NOTE: {
                     "rich_text": [],
+                },
+                TASK_PROP_TASK_APPROVAL_REQUESTED_AT: {
+                    "date": {
+                        "start": now.isoformat(),
+                    },
+                },
+                TASK_PROP_APPROVAL_REMINDER_AT: {
+                    "date": None,
                 },
             }
 
@@ -836,6 +876,73 @@ class DynamicNotionService:
 
         return results
 
+    async def fetch_pending_approval_tasks(self) -> List[NotionTaskSnapshot]:
+        """承認待ち状態のタスク一覧を取得（タスク承認待ち、完了承認待ち、延期承認待ち）"""
+        results: List[NotionTaskSnapshot] = []
+        has_more = True
+        start_cursor = None
+
+        # 承認待ちタスクのフィルタ条件（OR条件）
+        filter_conditions: Dict[str, Any] = {
+            "or": [
+                {
+                    "property": TASK_PROP_STATUS,
+                    "select": {"equals": TASK_STATUS_PENDING},
+                },
+                {
+                    "property": TASK_PROP_COMPLETION_STATUS,
+                    "select": {"equals": COMPLETION_STATUS_REQUESTED},
+                },
+                {
+                    "property": TASK_PROP_EXTENSION_STATUS,
+                    "select": {"equals": EXTENSION_STATUS_PENDING},
+                },
+            ]
+        }
+
+        print(f"🔍 承認待ちタスク取得開始:")
+        print(f"  - フィルタ条件: {filter_conditions}")
+        print(f"  - ステータス値: {TASK_STATUS_PENDING}, {COMPLETION_STATUS_REQUESTED}, {EXTENSION_STATUS_PENDING}")
+
+        while has_more:
+            query_payload: Dict[str, Any] = {
+                "database_id": self.database_id,
+                "page_size": 100,
+                "filter": filter_conditions,
+                "sorts": [
+                    {
+                        "timestamp": "created_time",
+                        "direction": "ascending",
+                    }
+                ],
+            }
+
+            if start_cursor:
+                query_payload["start_cursor"] = start_cursor
+
+            try:
+                response = self.client.databases.query(**query_payload)
+                page_count = len(response.get("results", []))
+                print(f"✅ Notionクエリ成功: {page_count}件のタスクを取得")
+            except Exception as e:
+                print(f"❌ 承認待ちタスク取得エラー: {e}")
+                print(f"   クエリペイロード: {query_payload}")
+                break
+
+            for page in response.get("results", []):
+                try:
+                    snapshot = self._to_snapshot(page)
+                    results.append(snapshot)
+                    print(f"  ✓ タスク追加: {snapshot.title} (status={snapshot.status}, completion={snapshot.completion_status}, extension={snapshot.extension_status})")
+                except Exception as exc:
+                    print(f"⚠️ Failed to parse pending approval task snapshot: {exc}")
+
+            has_more = response.get("has_more", False)
+            start_cursor = response.get("next_cursor")
+
+        print(f"📊 承認待ちタスク取得完了: 合計 {len(results)}件")
+        return results
+
     async def get_task_snapshot(self, page_id: str) -> Optional[NotionTaskSnapshot]:
         try:
             page = self.client.pages.retrieve(page_id=page_id)
@@ -925,6 +1032,78 @@ class DynamicNotionService:
         except Exception as exc:
             print(f"⚠️ Failed to update reminder state in Notion: {exc}")
 
+    async def update_approval_reminder_time(
+        self,
+        page_id: str,
+        reminder_time: datetime,
+    ) -> None:
+        """承認リマインド最終送信日時を更新"""
+        properties = {
+            TASK_PROP_APPROVAL_REMINDER_AT: {"date": {"start": self._format_datetime(reminder_time)}},
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+        except Exception as exc:
+            print(f"⚠️ Failed to update approval reminder time in Notion: {exc}")
+
+    async def disable_task(
+        self,
+        page_id: str,
+    ) -> None:
+        """タスクを無効化（論理削除）"""
+        properties = {
+            TASK_PROP_STATUS: {"select": {"name": TASK_STATUS_DISABLED}},
+        }
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+            print(f"✅ Task {page_id} has been disabled (logical delete)")
+        except Exception as exc:
+            print(f"⚠️ Failed to disable task in Notion: {exc}")
+            raise
+
+    async def save_thread_info(
+        self,
+        page_id: str,
+        assignee_thread_ts: Optional[str] = None,
+        assignee_thread_channel: Optional[str] = None,
+        requester_thread_ts: Optional[str] = None,
+        requester_thread_channel: Optional[str] = None,
+    ) -> None:
+        """Slackスレッド情報をNotionに保存"""
+        properties: Dict[str, Any] = {}
+
+        if assignee_thread_ts:
+            properties[TASK_PROP_ASSIGNEE_THREAD_TS] = {
+                "rich_text": [{"text": {"content": assignee_thread_ts}}]
+            }
+
+        if assignee_thread_channel:
+            properties[TASK_PROP_ASSIGNEE_THREAD_CHANNEL] = {
+                "rich_text": [{"text": {"content": assignee_thread_channel}}]
+            }
+
+        if requester_thread_ts:
+            properties[TASK_PROP_REQUESTER_THREAD_TS] = {
+                "rich_text": [{"text": {"content": requester_thread_ts}}]
+            }
+
+        if requester_thread_channel:
+            properties[TASK_PROP_REQUESTER_THREAD_CHANNEL] = {
+                "rich_text": [{"text": {"content": requester_thread_channel}}]
+            }
+
+        if not properties:
+            return
+
+        try:
+            self.client.pages.update(page_id=page_id, properties=properties)
+            print(f"✅ Saved thread info for task {page_id}")
+        except Exception as exc:
+            print(f"⚠️ Failed to save thread info to Notion: {exc}")
+            # スレッド情報の保存失敗は致命的ではないので、エラーを投げない
+
     async def mark_reminder_read(
         self,
         page_id: str,
@@ -966,6 +1145,7 @@ class DynamicNotionService:
         requested_due: datetime,
         reason: str,
     ) -> None:
+        now = datetime.now(timezone.utc)
         properties = {
             TASK_PROP_EXTENSION_STATUS: {
                 "select": {"name": EXTENSION_STATUS_PENDING},
@@ -980,6 +1160,12 @@ class DynamicNotionService:
                         "text": {"content": reason[:2000]},
                     }
                 ],
+            },
+            TASK_PROP_EXTENSION_REQUESTED_AT: {
+                "date": {"start": self._format_datetime(now)},
+            },
+            TASK_PROP_APPROVAL_REMINDER_AT: {
+                "date": None,
             },
         }
 
@@ -1077,6 +1263,9 @@ class DynamicNotionService:
             },
             TASK_PROP_LAST_READ_AT: {
                 "date": {"start": self._format_datetime(request_time)},
+            },
+            TASK_PROP_APPROVAL_REMINDER_AT: {
+                "date": None,
             },
         }
 
@@ -1245,6 +1434,30 @@ class DynamicNotionService:
         completion_reject_reason_prop = properties.get(TASK_PROP_COMPLETION_REJECT_REASON)
         completion_reject_reason = self._extract_rich_text(completion_reject_reason_prop)
 
+        created_time = self._parse_datetime_string(page.get("created_time"))
+
+        approval_reminder_prop = properties.get(TASK_PROP_APPROVAL_REMINDER_AT, {})
+        approval_reminder_last_sent_at = self._parse_datetime(approval_reminder_prop.get("date"))
+
+        extension_requested_at_prop = properties.get(TASK_PROP_EXTENSION_REQUESTED_AT, {})
+        extension_requested_at = self._parse_datetime(extension_requested_at_prop.get("date"))
+
+        task_approval_requested_at_prop = properties.get(TASK_PROP_TASK_APPROVAL_REQUESTED_AT, {})
+        task_approval_requested_at = self._parse_datetime(task_approval_requested_at_prop.get("date"))
+
+        # Slackスレッド情報を取得
+        assignee_thread_ts_prop = properties.get(TASK_PROP_ASSIGNEE_THREAD_TS)
+        assignee_thread_ts = self._extract_rich_text(assignee_thread_ts_prop)
+
+        assignee_thread_channel_prop = properties.get(TASK_PROP_ASSIGNEE_THREAD_CHANNEL)
+        assignee_thread_channel = self._extract_rich_text(assignee_thread_channel_prop)
+
+        requester_thread_ts_prop = properties.get(TASK_PROP_REQUESTER_THREAD_TS)
+        requester_thread_ts = self._extract_rich_text(requester_thread_ts_prop)
+
+        requester_thread_channel_prop = properties.get(TASK_PROP_REQUESTER_THREAD_CHANNEL)
+        requester_thread_channel = self._extract_rich_text(requester_thread_channel_prop)
+
         return NotionTaskSnapshot(
             page_id=page.get("id"),
             title=title,
@@ -1270,6 +1483,14 @@ class DynamicNotionService:
             completion_reject_reason=completion_reject_reason,
             has_due_read_prop=has_due_read_prop,
             has_overdue_read_prop=has_overdue_read_prop,
+            created_time=created_time,
+            approval_reminder_last_sent_at=approval_reminder_last_sent_at,
+            extension_requested_at=extension_requested_at,
+            task_approval_requested_at=task_approval_requested_at,
+            assignee_thread_ts=assignee_thread_ts,
+            assignee_thread_channel=assignee_thread_channel,
+            requester_thread_ts=requester_thread_ts,
+            requester_thread_channel=requester_thread_channel,
         )
 
     async def update_task_status(
@@ -1384,6 +1605,9 @@ class DynamicNotionService:
             },
             TASK_PROP_COMPLETION_REJECT_REASON: {
                 "rich_text": [],
+            },
+            TASK_PROP_APPROVAL_REMINDER_AT: {
+                "date": None,
             },
         }
 
