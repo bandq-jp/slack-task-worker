@@ -10,6 +10,7 @@ from src.application.dto.task_dto import (
     ReviseTaskRequestDto,
 )
 from src.application.services.task_metrics_service import TaskMetricsApplicationService
+from src.utils.concurrency import ConcurrencyCoordinator
 
 
 class TaskApplicationService:
@@ -22,12 +23,14 @@ class TaskApplicationService:
         slack_service,  # SlackServiceインターフェース
         notion_service,  # NotionServiceインターフェース
         task_metrics_service: Optional[TaskMetricsApplicationService] = None,
+        concurrency_coordinator: Optional[ConcurrencyCoordinator] = None,
     ):
         self.task_repository = task_repository
         self.user_repository = user_repository
         self.slack_service = slack_service
         self.notion_service = notion_service
         self.task_metrics_service = task_metrics_service
+        self.concurrency = concurrency_coordinator or ConcurrencyCoordinator()
 
     async def create_task_request(self, dto: CreateTaskRequestDto) -> TaskResponseDto:
         """タスク依頼を作成"""
@@ -109,7 +112,14 @@ class TaskApplicationService:
         if task.requester_slack_id != dto.requester_slack_id:
             raise ValueError("Only the original requester can revise this task")
 
-        requester_info = await self.slack_service.get_user_info(dto.requester_slack_id)
+        lock_key = task.notion_page_id or task.id
+        async with self.concurrency.guard(lock_key):
+            return await self._revise_task_request_locked(task, dto)
+
+    async def _revise_task_request_locked(self, task: TaskRequest, dto: ReviseTaskRequestDto) -> TaskResponseDto:
+        requester_slack_id = dto.requester_slack_id
+        
+        requester_info = await self.slack_service.get_user_info(requester_slack_id)
         assignee_info = await self.slack_service.get_user_info(dto.assignee_slack_id)
 
         requester_email = requester_info.get("profile", {}).get("email")
@@ -182,6 +192,13 @@ class TaskApplicationService:
         if not task:
             raise ValueError(f"Task not found: {dto.task_id}")
 
+        lock_key = task.notion_page_id or task.id
+
+        async with self.concurrency.guard(lock_key):
+            return await self._handle_task_approval_locked(task, dto)
+
+    async def _handle_task_approval_locked(self, task: TaskRequest, dto: TaskApprovalDto) -> TaskResponseDto:
+        
         # ユーザー情報を取得
         assignee_info = await self.slack_service.get_user_info(task.assignee_slack_id)
         requester_info = await self.slack_service.get_user_info(task.requester_slack_id)

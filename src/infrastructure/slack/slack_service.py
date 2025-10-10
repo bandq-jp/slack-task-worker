@@ -1855,3 +1855,51 @@ class SlackService:
         except SlackApiError as e:
             print(f"Error opening rejection modal: {e}")
             raise
+
+    def open_processing_modal(self, trigger_id: str, title: str, message: str, emoji: str = "⏳") -> Optional[str]:
+        """処理中モーダルを表示し、view IDを返す"""
+        try:
+            modal = {
+                "type": "modal",
+                "callback_id": "processing_modal",
+                "title": {"type": "plain_text", "text": title[:24]},
+                "close": {"type": "plain_text", "text": "閉じる"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"{emoji} {message}",
+                        },
+                    }
+                ],
+            }
+            response = self.client.views_open(trigger_id=trigger_id, view=modal)
+            return response.get("view", {}).get("id")
+        except SlackApiError as e:
+            print(f"Error opening processing modal: {e}")
+            return None
+
+    def update_modal_message(self, view_id: str, title: str, message: str, emoji: str = "✅", close_text: str = "閉じる") -> None:
+        """モーダルのメッセージを更新"""
+        if not view_id:
+            return
+        try:
+            view = {
+                "type": "modal",
+                "callback_id": "processing_modal_result",
+                "title": {"type": "plain_text", "text": title[:24]},
+                "close": {"type": "plain_text", "text": close_text},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"{emoji} {message}",
+                        },
+                    }
+                ],
+            }
+            self.client.views_update(view_id=view_id, view=view)
+        except SlackApiError as e:
+            print(f"Error updating modal message: {e}")

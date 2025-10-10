@@ -12,6 +12,8 @@ SlackからNotionへのタスク管理システム。DDD/Clean Architectureを�
 - 依頼先の完了報告 → 依頼者承認フローでタスク完了を確定
 - ゲストユーザー対応の高速ユーザーマッピング
 - 承認・差し戻し時にNotionのステータス更新
+- 高負荷時の競合を防ぐための排他制御仕組み（詳しくは `docs/concurrency_overview.md` 参照）
+- Slackプレゼンテーション層はモジュール分割され、承認ボタン押下時には処理中モーダルを表示（`docs/slack_presentation_architecture.md`）
 
 ## 📁 プロジェクト構造
 
