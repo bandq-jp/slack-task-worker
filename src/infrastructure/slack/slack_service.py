@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from src.infrastructure.notion.dynamic_notion_service import (
     TASK_STATUS_COMPLETED,
 )
 from src.utils.text_converter import convert_rich_text_to_plain_text
+from src.utils.concurrency import AsyncToThreadRunner
 from zoneinfo import ZoneInfo
 
 REMINDER_STAGE_LABELS = {
@@ -50,6 +52,11 @@ class SlackService:
         self.client = WebClient(token=slack_bot_token)
         self.user_client = WebClient(token=slack_token)
         self.env = env
+        self._client_runner = AsyncToThreadRunner(max_concurrency=8)
+
+    async def _call_slack(self, func, *args, key: Optional[str] = None, **kwargs):
+        """Execute Slack SDK call in a worker thread so the event loop stays responsive."""
+        return await self._client_runner.run(func, *args, key=key, **kwargs)
 
     @property
     def app_name_suffix(self) -> str:
@@ -82,10 +89,13 @@ class SlackService:
     def _urgency_options(self) -> List[Dict[str, Any]]:
         return copy.deepcopy(URGENCY_OPTIONS)
 
-    def _get_user_select_options(
+    async def _get_user_select_options(
         self, selected_user_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, bool]:
-        users_response = self.client.users_list()
+        users_response = await self._call_slack(
+            self.client.users_list,
+            key="users_list",
+        )
         users = users_response["members"]
 
         internal_users = [
@@ -151,7 +161,7 @@ class SlackService:
 
         return None
 
-    def _send_message_with_thread(
+    async def _send_message_with_thread(
         self,
         channel: str,
         blocks: List[Dict[str, Any]],
@@ -179,13 +189,17 @@ class SlackService:
             if thread_ts:
                 params["thread_ts"] = thread_ts
 
-            response = self.client.chat_postMessage(**params)
+            response = await self._call_slack(
+                self.client.chat_postMessage,
+                key=f"chat_post:{channel}:{thread_ts or 'root'}",
+                **params,
+            )
             return response
         except SlackApiError as e:
             print(f"❌ Error sending message: {e}")
             raise
 
-    def _update_message(
+    async def _update_message(
         self,
         channel: str,
         ts: str,
@@ -194,11 +208,13 @@ class SlackService:
     ) -> Dict[str, Any]:
         """メッセージを更新（親メッセージの状態更新用）"""
         try:
-            response = self.client.chat_update(
+            response = await self._call_slack(
+                self.client.chat_update,
                 channel=channel,
                 ts=ts,
                 blocks=blocks,
                 text=text,
+                key=f"chat_update:{channel}:{ts}",
             )
             return response
         except SlackApiError as e:
@@ -214,14 +230,22 @@ class SlackService:
     ) -> None:
         """指定ユーザーへDMを送信"""
         try:
-            dm = self.client.conversations_open(users=slack_user_id)
+            dm = await self._call_slack(
+                self.client.conversations_open,
+                users=slack_user_id,
+                key=f"dm:{slack_user_id}",
+            )
             payload: Dict[str, Any] = {
                 "channel": dm["channel"]["id"],
                 "text": text,
             }
             if blocks:
                 payload["blocks"] = blocks
-            self.client.chat_postMessage(**payload)
+            await self._call_slack(
+                self.client.chat_postMessage,
+                key=f"dm:{slack_user_id}",
+                **payload,
+            )
         except SlackApiError as e:
             print(f"⚠️ Error sending direct message to {slack_user_id}: {e}")
             raise
@@ -471,7 +495,7 @@ class SlackService:
                     requester_slack_id=requester_slack_id,
                     status=new_status,
                 )
-                self._update_message(
+                await self._update_message(
                     channel=assignee_thread_channel,
                     ts=assignee_thread_ts,
                     blocks=assignee_blocks,
@@ -487,7 +511,7 @@ class SlackService:
                     assignee_slack_id=assignee_slack_id,
                     status=new_status,
                 )
-                self._update_message(
+                await self._update_message(
                     channel=requester_thread_channel,
                     ts=requester_thread_ts,
                     blocks=requester_blocks,
@@ -503,7 +527,11 @@ class SlackService:
         """ユーザー情報を取得"""
         try:
             print(f"🔍 Getting user info for: {user_id}")
-            response = self.client.users_info(user=user_id)
+            response = await self._call_slack(
+                self.client.users_info,
+                user=user_id,
+                key=f"user_info:{user_id}",
+            )
             user_data = response["user"]
 
             print(f"📋 User data keys: {list(user_data.keys())}")
@@ -546,7 +574,11 @@ class SlackService:
         """
         try:
             # === 1. 依頼先（承認者）へのDM（親メッセージ） ===
-            assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+            assignee_dm = await self._call_slack(
+                self.client.conversations_open,
+                users=assignee_slack_id,
+                key=f"dm:{assignee_slack_id}",
+            )
             assignee_channel = assignee_dm["channel"]["id"]
 
             assignee_blocks, assignee_text = self._build_assignee_parent_message(
@@ -556,7 +588,7 @@ class SlackService:
                 status=TASK_STATUS_PENDING,
             )
 
-            assignee_response = self._send_message_with_thread(
+            assignee_response = await self._send_message_with_thread(
                 channel=assignee_channel,
                 blocks=assignee_blocks,
                 text=assignee_text,
@@ -564,7 +596,11 @@ class SlackService:
             assignee_thread_ts = assignee_response["ts"]
 
             # === 2. 依頼者へのDM（親メッセージ） ===
-            requester_dm = self.client.conversations_open(users=requester_slack_id)
+            requester_dm = await self._call_slack(
+                self.client.conversations_open,
+                users=requester_slack_id,
+                key=f"dm:{requester_slack_id}",
+            )
             requester_channel = requester_dm["channel"]["id"]
 
             requester_blocks, requester_text = self._build_requester_parent_message(
@@ -574,7 +610,7 @@ class SlackService:
                 status=TASK_STATUS_PENDING,
             )
 
-            requester_response = self._send_message_with_thread(
+            requester_response = await self._send_message_with_thread(
                 channel=requester_channel,
                 blocks=requester_blocks,
                 text=requester_text,
@@ -609,7 +645,11 @@ class SlackService:
             if thread_channel:
                 channel_id = thread_channel
             else:
-                dm_response = self.client.conversations_open(users=requester_slack_id)
+                dm_response = await self._call_slack(
+                    self.client.conversations_open,
+                    users=requester_slack_id,
+                    key=f"dm:{requester_slack_id}",
+                )
                 channel_id = dm_response["channel"]["id"]
 
             blocks = [
@@ -623,7 +663,7 @@ class SlackService:
             ]
 
             # スレッド返信として送信
-            self._send_message_with_thread(
+            await self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
                 text="✅ タスクが承認されました",
@@ -646,7 +686,11 @@ class SlackService:
             if thread_channel:
                 channel_id = thread_channel
             else:
-                dm_response = self.client.conversations_open(users=requester_slack_id)
+                dm_response = await self._call_slack(
+                    self.client.conversations_open,
+                    users=requester_slack_id,
+                    key=f"dm:{requester_slack_id}",
+                )
                 channel_id = dm_response["channel"]["id"]
 
             blocks = [
@@ -663,7 +707,7 @@ class SlackService:
             ]
 
             # スレッド返信として送信
-            self._send_message_with_thread(
+            await self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
                 text="❌ タスクが差し戻されました",
@@ -689,7 +733,11 @@ class SlackService:
             if thread_channel:
                 channel_id = thread_channel
             else:
-                dm_response = self.client.conversations_open(users=assignee_slack_id)
+                dm_response = await self._call_slack(
+                    self.client.conversations_open,
+                    users=assignee_slack_id,
+                    key=f"dm:{assignee_slack_id}",
+                )
                 channel_id = dm_response["channel"]["id"]
 
             stage_label = REMINDER_STAGE_LABELS.get(stage, stage or "リマインド")
@@ -723,7 +771,7 @@ class SlackService:
                 )
 
             # スレッド返信として送信（@メンションで通知）
-            return self._send_message_with_thread(
+            return await self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
                 text=f"<@{assignee_slack_id}> {stage_label}",
@@ -794,7 +842,12 @@ class SlackService:
                 "private_metadata": json.dumps(requested_metadata),
             }
 
-            return self.client.views_open(trigger_id=trigger_id, view=modal)
+            return await self._call_slack(
+                self.client.views_open,
+                trigger_id=trigger_id,
+                view=modal,
+                key=f"view_open:{trigger_id}",
+            )
 
         except SlackApiError as e:
             print(f"Error opening extension request modal: {e}")
@@ -817,7 +870,11 @@ class SlackService:
             if thread_channel:
                 channel_id = thread_channel
             else:
-                dm_response = self.client.conversations_open(users=requester_slack_id)
+                dm_response = await self._call_slack(
+                    self.client.conversations_open,
+                    users=requester_slack_id,
+                    key=f"dm:{requester_slack_id}",
+                )
                 channel_id = dm_response["channel"]["id"]
 
             due_text = self._format_datetime(snapshot.due_date) if getattr(snapshot, "due_date", None) else "未設定"
@@ -871,7 +928,7 @@ class SlackService:
             ]
 
             # スレッドで送信（メンション付き）
-            return self._send_message_with_thread(
+            return await self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
                 text=f"<@{requester_slack_id}> 延期承認リクエスト: {snapshot.title}",
@@ -893,16 +950,23 @@ class SlackService:
         try:
             # スレッド情報があればスレッドに返信、なければDM
             if thread_channel and thread_ts:
-                self.client.chat_postMessage(
+                await self._call_slack(
+                    self.client.chat_postMessage,
                     channel=thread_channel,
                     thread_ts=thread_ts,
                     text=f"⏳ <@{assignee_slack_id}> 延期申請を送信しました。\n希望納期: {self._format_datetime(requested_due)}",
+                    key=f"chat_post:{thread_channel}:{thread_ts}",
                 )
             else:
                 # フォールバック: DM送信
-                dm_response = self.client.conversations_open(users=assignee_slack_id)
+                dm_response = await self._call_slack(
+                    self.client.conversations_open,
+                    users=assignee_slack_id,
+                    key=f"dm:{assignee_slack_id}",
+                )
                 channel_id = dm_response["channel"]["id"]
-                self.client.chat_postMessage(
+                await self._call_slack(
+                    self.client.chat_postMessage,
                     channel=channel_id,
                     text="延期申請を送信しました。依頼者の承認をお待ちください。",
                     blocks=[
@@ -914,6 +978,7 @@ class SlackService:
                             },
                         }
                     ],
+                    key=f"chat_post:{channel_id}:notify_extension_submitted",
                 )
         except SlackApiError as e:
             print(f"Error notifying submitter about extension request: {e}")
@@ -1059,7 +1124,12 @@ class SlackService:
                 }),
             }
 
-            return self.client.views_open(trigger_id=trigger_id, view=modal)
+            return await self._call_slack(
+                self.client.views_open,
+                trigger_id=trigger_id,
+                view=modal,
+                key=f"view_open:{trigger_id}",
+            )
         except SlackApiError as e:
             print(f"Error opening completion modal: {e}")
             raise
@@ -1138,7 +1208,7 @@ class SlackService:
             )
 
             # スレッドで送信（メンション付き）
-            return self._send_message_with_thread(
+            return await self._send_message_with_thread(
                 channel=channel_id,
                 blocks=blocks,
                 text=f"<@{requester_slack_id}> 完了承認リクエスト: {snapshot.title}",
@@ -1279,7 +1349,11 @@ class SlackService:
                 thread_ts = assignee_thread_ts or requester_thread_ts
 
                 if not channel_id:
-                    dm = self.client.conversations_open(users=assignee_slack_id)
+                    dm = await self._call_slack(
+                        self.client.conversations_open,
+                        users=assignee_slack_id,
+                        key=f"dm:{assignee_slack_id}",
+                    )
                     channel_id = dm["channel"]["id"]
 
                 blocks = [
@@ -1295,7 +1369,7 @@ class SlackService:
                     },
                 ]
 
-                return self._send_message_with_thread(
+                return await self._send_message_with_thread(
                     channel=channel_id,
                     blocks=blocks,
                     text=f"<@{assignee_slack_id}> タスク承認待ちリマインド",
@@ -1316,7 +1390,11 @@ class SlackService:
                 assignee_thread = assignee_thread_ts
             else:
                 # フォールバック: DM送信（スレッドなし）
-                assignee_dm = self.client.conversations_open(users=assignee_slack_id)
+                assignee_dm = await self._call_slack(
+                    self.client.conversations_open,
+                    users=assignee_slack_id,
+                    key=f"dm:{assignee_slack_id}",
+                )
                 assignee_channel_id = assignee_dm["channel"]["id"]
                 assignee_thread = None
 
@@ -1333,7 +1411,7 @@ class SlackService:
                 },
             ]
 
-            return self._send_message_with_thread(
+            return await self._send_message_with_thread(
                 channel=assignee_channel_id,
                 blocks=assignee_blocks,
                 text=f"<@{assignee_slack_id}> タスク承認待ちリマインド",
@@ -1360,7 +1438,11 @@ class SlackService:
 
             # フォールバック: スレッドがなければDM
             if not thread_channel:
-                dm = self.client.conversations_open(users=target_slack_id)
+                dm = await self._call_slack(
+                    self.client.conversations_open,
+                    users=target_slack_id,
+                    key=f"dm:{target_slack_id}",
+                )
                 thread_channel = dm["channel"]["id"]
                 thread_ts = None
 
@@ -1377,7 +1459,7 @@ class SlackService:
                 }
             ]
 
-            return self._send_message_with_thread(
+            return await self._send_message_with_thread(
                 channel=thread_channel,
                 blocks=blocks,
                 text=f"<@{target_slack_id}> 完了承認待ちリマインド",
@@ -1404,7 +1486,11 @@ class SlackService:
             thread_channel = getattr(snapshot, "requester_thread_channel", None)
             thread_ts = getattr(snapshot, "requester_thread_ts", None)
             if not thread_channel:
-                dm = self.client.conversations_open(users=target_slack_id)
+                dm = await self._call_slack(
+                    self.client.conversations_open,
+                    users=target_slack_id,
+                    key=f"dm:{target_slack_id}",
+                )
                 thread_channel = dm["channel"]["id"]
                 thread_ts = None
 
@@ -1421,7 +1507,7 @@ class SlackService:
                 },
             ]
 
-            return self._send_message_with_thread(
+            return await self._send_message_with_thread(
                 channel=thread_channel,
                 blocks=blocks,
                 text=f"<@{target_slack_id}> 延期承認待ちリマインド",
@@ -1501,11 +1587,16 @@ class SlackService:
                 "private_metadata": json.dumps({"requester_id": user_id}),
             }
 
-            open_resp = self.client.views_open(trigger_id=trigger_id, view=loading_modal)
+            open_resp = await self._call_slack(
+                self.client.views_open,
+                trigger_id=trigger_id,
+                view=loading_modal,
+                key=f"view_open:{trigger_id}:loading",
+            )
             view_id = open_resp["view"]["id"]
 
             # ユーザーリストの取得（少し時間がかかる可能性があるため open 後に実行）
-            user_options, _, internal_count, limit_hit = self._get_user_select_options()
+            user_options, _, internal_count, limit_hit = await self._get_user_select_options()
 
             print(f"📊 社内メンバー: {internal_count}人（表示: {min(internal_count, 100)}人）")
             if limit_hit:
@@ -1594,7 +1685,12 @@ class SlackService:
             }
 
             # ローディングビューから本ビューへ更新
-            self.client.views_update(view_id=view_id, view=full_modal)
+            await self._call_slack(
+                self.client.views_update,
+                view_id=view_id,
+                view=full_modal,
+                key=f"view_update:{view_id}",
+            )
 
         except SlackApiError as e:
             print(f"Error opening modal: {e}")
@@ -1621,10 +1717,15 @@ class SlackService:
                 "private_metadata": json.dumps({"task_id": task.id, **private_metadata}),
             }
 
-            open_resp = self.client.views_open(trigger_id=trigger_id, view=loading_modal)
+            open_resp = await self._call_slack(
+                self.client.views_open,
+                trigger_id=trigger_id,
+                view=loading_modal,
+                key=f"view_open:{trigger_id}:revision",
+            )
             view_id = open_resp["view"]["id"]
 
-            assignee_options, assignee_initial, internal_count, limit_hit = self._get_user_select_options(
+            assignee_options, assignee_initial, internal_count, limit_hit = await self._get_user_select_options(
                 selected_user_id=task.assignee_slack_id
             )
 
@@ -1760,7 +1861,12 @@ class SlackService:
                 "private_metadata": metadata_payload,
             }
 
-            self.client.views_update(view_id=view_id, view=full_modal)
+            await self._call_slack(
+                self.client.views_update,
+                view_id=view_id,
+                view=full_modal,
+                key=f"view_update:{view_id}:revision",
+            )
 
         except SlackApiError as e:
             print(f"Error opening revision modal: {e}")

@@ -9,6 +9,7 @@ from src.domain.entities.task import TaskRequest
 from src.domain.entities.notion_user import NotionUser
 from src.application.services.user_mapping_service import UserMappingApplicationService
 from src.utils.text_converter import convert_rich_text_to_plain_text
+from src.utils.concurrency import AsyncToThreadRunner
 
 
 REMINDER_STAGE_NOT_SENT = "未送信"
@@ -127,6 +128,7 @@ class DynamicNotionService:
         audit_database_id: Optional[str] = None,
     ):
         self.client = Client(auth=notion_token)
+        self._client_runner = AsyncToThreadRunner(max_concurrency=6)
         self.database_id = self._normalize_database_id(database_id)
         self.user_mapping_service = user_mapping_service
         self.audit_database_id = (
@@ -134,6 +136,10 @@ class DynamicNotionService:
             if audit_database_id
             else None
         )
+
+    async def _call_notion(self, func, *args, key: Optional[str] = None, **kwargs):
+        """Execute a Notion SDK call inside a worker thread so we don't block the event loop."""
+        return await self._client_runner.run(func, *args, key=key, **kwargs)
 
     def _normalize_database_id(self, database_id: str) -> str:
         """データベースIDを正規化（ハイフンを削除）"""
@@ -668,7 +674,8 @@ class DynamicNotionService:
                 },
             ])
 
-            response = self.client.pages.create(
+            response = await self._call_notion(
+                self.client.pages.create,
                 parent={"database_id": self.database_id},
                 properties=properties,
                 children=page_children,
@@ -750,7 +757,7 @@ class DynamicNotionService:
         """
         try:
             # ページ情報を取得
-            page = self.client.pages.retrieve(page_id=task_id)
+            page = await self._call_notion(self.client.pages.retrieve, page_id=task_id)
             properties = page.get("properties", {})
 
             # プロパティから情報を抽出
@@ -769,7 +776,7 @@ class DynamicNotionService:
                     # ユーザー情報を取得
                     user_id = people[0]["id"]
                     try:
-                        user = self.client.users.retrieve(user_id=user_id)
+                        user = await self._call_notion(self.client.users.retrieve, user_id=user_id)
                         requester_name = user.get("name", "")
                     except Exception:
                         requester_name = "不明"
@@ -781,7 +788,7 @@ class DynamicNotionService:
                     # ユーザー情報を取得
                     user_id = people[0]["id"]
                     try:
-                        user = self.client.users.retrieve(user_id=user_id)
+                        user = await self._call_notion(self.client.users.retrieve, user_id=user_id)
                         assignee_name = user.get("name", "")
                     except Exception:
                         assignee_name = "不明"
@@ -791,7 +798,10 @@ class DynamicNotionService:
                 status = properties["ステータス"]["select"]["name"]
 
             # ページコンテンツを取得
-            content_blocks = self.client.blocks.children.list(block_id=task_id)
+            content_blocks = await self._call_notion(
+                self.client.blocks.children.list,
+                block_id=task_id,
+            )
             content = ""
             for block in content_blocks.get("results", []):
                 if block["type"] == "paragraph" and block.get("paragraph", {}).get("rich_text"):
@@ -854,7 +864,10 @@ class DynamicNotionService:
             if start_cursor:
                 query_payload["start_cursor"] = start_cursor
             try:
-                response = self.client.databases.query(**query_payload)
+                response = await self._call_notion(
+                    self.client.databases.query,
+                    **query_payload,
+                )
             except Exception as e:
                 if "multiple data sources" in str(e).lower():
                     print("❌ Notionデータベースは複数ソースの結合DBのため、APIでの検索ができません。")
@@ -921,7 +934,10 @@ class DynamicNotionService:
                 query_payload["start_cursor"] = start_cursor
 
             try:
-                response = self.client.databases.query(**query_payload)
+                response = await self._call_notion(
+                    self.client.databases.query,
+                    **query_payload,
+                )
                 page_count = len(response.get("results", []))
                 print(f"✅ Notionクエリ成功: {page_count}件のタスクを取得")
             except Exception as e:
@@ -945,7 +961,7 @@ class DynamicNotionService:
 
     async def get_task_snapshot(self, page_id: str) -> Optional[NotionTaskSnapshot]:
         try:
-            page = self.client.pages.retrieve(page_id=page_id)
+            page = await self._call_notion(self.client.pages.retrieve, page_id=page_id)
             return self._to_snapshot(page)
         except Exception as exc:
             print(f"⚠️ Failed to get Notion task snapshot: {exc}")
@@ -1006,7 +1022,8 @@ class DynamicNotionService:
                 }
 
         try:
-            response = self.client.pages.create(
+            response = await self._call_notion(
+                self.client.pages.create,
                 parent={"database_id": self.audit_database_id},
                 properties=properties,
             )
@@ -1028,7 +1045,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:reminder_state",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to update reminder state in Notion: {exc}")
 
@@ -1043,7 +1065,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:approval_reminder",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to update approval reminder time in Notion: {exc}")
 
@@ -1057,7 +1084,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:disable",
+            )
             print(f"✅ Task {page_id} has been disabled (logical delete)")
         except Exception as exc:
             print(f"⚠️ Failed to disable task in Notion: {exc}")
@@ -1098,7 +1130,12 @@ class DynamicNotionService:
             return
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:threads",
+            )
             print(f"✅ Saved thread info for task {page_id}")
         except Exception as exc:
             print(f"⚠️ Failed to save thread info to Notion: {exc}")
@@ -1124,7 +1161,12 @@ class DynamicNotionService:
             properties[TASK_PROP_REMINDER_READ] = {"checkbox": True}
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:reminder_read",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to mark reminder as read: {exc}")
             # フォールバック: ステージ別プロパティが存在しない場合は従来の既読フラグ/ステージを使用
@@ -1134,7 +1176,12 @@ class DynamicNotionService:
                     TASK_PROP_REMINDER_READ: {"checkbox": True},
                     TASK_PROP_LAST_READ_AT: {"date": {"start": self._format_datetime(read_time)}},
                 }
-                self.client.pages.update(page_id=page_id, properties=fallback_props)
+                await self._call_notion(
+                    self.client.pages.update,
+                    page_id=page_id,
+                    properties=fallback_props,
+                    key=f"page:{page_id}:reminder_read_fallback",
+                )
                 print("🔁 Fallback: marked as read using legacy properties")
             except Exception as exc2:
                 print(f"❌ Fallback failed to mark reminder as read: {exc2}")
@@ -1170,7 +1217,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:extension_request",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to register extension request: {exc}")
 
@@ -1216,7 +1268,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:extension_approve",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to approve extension: {exc}")
 
@@ -1231,7 +1288,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:extension_reject",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to reject extension: {exc}")
 
@@ -1282,7 +1344,12 @@ class DynamicNotionService:
             properties[TASK_PROP_COMPLETION_NOTE] = {"rich_text": []}
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:completion_request",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to register completion request: {exc}")
 
@@ -1308,7 +1375,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:completion_approve",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to approve completion: {exc}")
 
@@ -1357,7 +1429,12 @@ class DynamicNotionService:
         }
 
         try:
-            self.client.pages.update(page_id=page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=page_id,
+                properties=properties,
+                key=f"page:{page_id}:completion_reject",
+            )
         except Exception as exc:
             print(f"⚠️ Failed to reject completion request: {exc}")
 
@@ -1521,9 +1598,11 @@ class DynamicNotionService:
                     ],
                 }
 
-            self.client.pages.update(
+            await self._call_notion(
+                self.client.pages.update,
                 page_id=page_id,
                 properties=properties,
+                key=f"page:{page_id}:status",
             )
 
         except Exception as e:
@@ -1636,7 +1715,12 @@ class DynamicNotionService:
             properties[TASK_PROP_ASSIGNEE] = {"people": []}
 
         try:
-            self.client.pages.update(page_id=task.notion_page_id, properties=properties)
+            await self._call_notion(
+                self.client.pages.update,
+                page_id=task.notion_page_id,
+                properties=properties,
+                key=f"page:{task.notion_page_id}:revision",
+            )
         except Exception as update_error:
             print(f"⚠️ Failed to update Notion task properties on revision: {update_error}")
             return
@@ -1658,19 +1742,21 @@ class DynamicNotionService:
         requester_email: Optional[str],
         assignee_email: Optional[str],
     ) -> None:
-        children = self._list_page_children(page_id)
-        self._update_task_summary_callout(children, task, requester_email, assignee_email)
-        self._update_description_section(page_id, children, task.description)
+        children = await self._list_page_children(page_id)
+        await self._update_task_summary_callout(children, task, requester_email, assignee_email)
+        await self._update_description_section(page_id, children, task.description)
 
-    def _list_page_children(self, page_id: str) -> List[Dict[str, Any]]:
+    async def _list_page_children(self, page_id: str) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         start_cursor: Optional[str] = None
 
         while True:
-            response = self.client.blocks.children.list(
+            response = await self._call_notion(
+                self.client.blocks.children.list,
                 block_id=page_id,
                 start_cursor=start_cursor,
                 page_size=100,
+                key=f"page:{page_id}:children",
             )
             results.extend(response.get("results", []))
             if not response.get("has_more"):
@@ -1679,7 +1765,7 @@ class DynamicNotionService:
 
         return results
 
-    def _update_task_summary_callout(
+    async def _update_task_summary_callout(
         self,
         children: List[Dict[str, Any]],
         task: TaskRequest,
@@ -1703,7 +1789,8 @@ class DynamicNotionService:
             )
 
             try:
-                self.client.blocks.update(
+                await self._call_notion(
+                    self.client.blocks.update,
                     block_id=block["id"],
                     callout={
                         "rich_text": [
@@ -1715,13 +1802,14 @@ class DynamicNotionService:
                         "icon": icon,
                         "color": color,
                     },
+                    key=f"block:{block['id']}:summary",
                 )
             except Exception as update_error:
                 print(f"⚠️ Failed to update summary callout: {update_error}")
             finally:
                 break
 
-    def _update_description_section(
+    async def _update_description_section(
         self,
         page_id: str,
         children: List[Dict[str, Any]],
@@ -1766,10 +1854,12 @@ class DynamicNotionService:
                 }
 
                 try:
-                    append_response = self.client.blocks.children.append(
+                    append_response = await self._call_notion(
+                        self.client.blocks.children.append,
                         block_id=page_id,
                         children=[heading_block],
                         **({"after": insert_after} if insert_after else {}),
+                        key=f"page:{page_id}:desc_heading",
                     )
                     results = append_response.get("results", [])
                     if not results or not results[0].get("id"):
@@ -1784,17 +1874,24 @@ class DynamicNotionService:
                 end_index = self._find_description_end(children, description_heading_index, progress_heading_index)
                 for block in children[description_heading_index + 1 : end_index]:
                     try:
-                        self.client.blocks.update(block_id=block["id"], archived=True)
+                        await self._call_notion(
+                            self.client.blocks.update,
+                            block_id=block["id"],
+                            archived=True,
+                            key=f"block:{block['id']}:archive",
+                        )
                     except Exception as archive_error:
                         print(f"⚠️ Failed to archive old description block: {archive_error}")
 
             after_id = heading_id
             for block in description_blocks:
                 try:
-                    response = self.client.blocks.children.append(
+                    response = await self._call_notion(
+                        self.client.blocks.children.append,
                         block_id=page_id,
                         children=[block],
                         after=after_id,
+                        key=f"page:{page_id}:desc_append",
                     )
                     results = response.get("results", [])
                     if results and results[0].get("id"):
@@ -1802,7 +1899,12 @@ class DynamicNotionService:
                 except Exception as append_error:
                     print(f"⚠️ Failed to append description block: {append_error}")
                     try:
-                        fallback_response = self.client.blocks.children.append(block_id=page_id, children=[block])
+                        fallback_response = await self._call_notion(
+                            self.client.blocks.children.append,
+                            block_id=page_id,
+                            children=[block],
+                            key=f"page:{page_id}:desc_append_fallback",
+                        )
                         results = fallback_response.get("results", [])
                         if results and results[0].get("id"):
                             after_id = results[0]["id"]
@@ -1814,11 +1916,21 @@ class DynamicNotionService:
                 end_index = self._find_description_end(children, description_heading_index, progress_heading_index)
                 for block in children[description_heading_index + 1 : end_index]:
                     try:
-                        self.client.blocks.update(block_id=block["id"], archived=True)
+                        await self._call_notion(
+                            self.client.blocks.update,
+                            block_id=block["id"],
+                            archived=True,
+                            key=f"block:{block['id']}:archive_desc",
+                        )
                     except Exception as archive_error:
                         print(f"⚠️ Failed to archive description block: {archive_error}")
                 try:
-                    self.client.blocks.update(block_id=children[description_heading_index]["id"], archived=True)
+                    await self._call_notion(
+                        self.client.blocks.update,
+                        block_id=children[description_heading_index]["id"],
+                        archived=True,
+                        key=f"block:{children[description_heading_index]['id']}:archive_heading",
+                    )
                 except Exception as archive_error:
                     print(f"⚠️ Failed to archive description heading: {archive_error}")
 
