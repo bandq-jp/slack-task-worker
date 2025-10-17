@@ -770,6 +770,16 @@ async def handle_interactive(request: Request):
             message = payload.get("message", {})
             message_ts = message.get("ts")
             message_blocks = message.get("blocks", [])
+            stage_label = REMINDER_STAGE_LABELS.get(stage, stage or "リマインド")
+
+            processing_view_id = None
+            if trigger_id:
+                processing_view_id = slack_service.open_processing_modal(
+                    trigger_id=trigger_id,
+                    title=f"既読処理{settings.app_name_suffix}",
+                    message=f"{stage_label}を既読にしています。しばらくお待ちください。",
+                )
+
             async def run_mark_read():
                 if not page_id:
                     try:
@@ -780,15 +790,21 @@ async def handle_interactive(request: Request):
                         )
                     except Exception as dm_error:
                         print(f"⚠️ Failed to notify user about missing page_id: {dm_error}")
+                    if processing_view_id:
+                        slack_service.update_modal_message(
+                            view_id=processing_view_id,
+                            title=f"既読エラー{settings.app_name_suffix}",
+                            message="タスク情報の取得に失敗しました。",
+                            emoji="⚠️",
+                            close_text="閉じる",
+                        )
                     return
 
                 read_time = datetime.now(JST)
                 try:
                     await notion_service.mark_reminder_read(page_id, read_time, stage)
-                    snapshot = await notion_service.get_task_snapshot(page_id)
                     user_info = await slack_service.get_user_info(user_id)
                     actor_email = user_info.get("profile", {}).get("email") if user_info else None
-                    stage_label = REMINDER_STAGE_LABELS.get(stage, stage or "リマインド")
                     detail = f"{stage_label} を既読 ({read_time.astimezone().strftime('%Y-%m-%d %H:%M')})"
                     await notion_service.record_audit_log(
                         task_page_id=page_id,
@@ -799,7 +815,8 @@ async def handle_interactive(request: Request):
 
                     if channel_id and message_ts and message_blocks:
                         try:
-                            updated_text = f"✅ <@{user_id}> が{stage_label}を既読 ({_format_datetime_text(datetime.now(JST))})"
+                            formatted_time = _format_datetime_text(read_time)
+                            updated_text = f"✅ <@{user_id}> が{stage_label}を既読 ({formatted_time})"
                             updated_blocks = _mark_read_update_blocks(message_blocks, updated_text)
                             slack_service.client.chat_update(
                                 channel=channel_id,
@@ -810,8 +827,31 @@ async def handle_interactive(request: Request):
                         except Exception as update_error:
                             print(f"⚠️ Failed to update reminder message: {update_error}")
 
+                    if processing_view_id:
+                        try:
+                            slack_service.update_modal_message(
+                                view_id=processing_view_id,
+                                title=f"既読処理完了{settings.app_name_suffix}",
+                                message=f"{stage_label}を既読にしました。処理時刻: {_format_datetime_text(read_time)}",
+                                emoji="✅",
+                                close_text="閉じる",
+                            )
+                        except Exception as modal_update_error:
+                            print(f"⚠️ Failed to update processing modal: {modal_update_error}")
+
                 except Exception as ack_error:
                     print(f"⚠️ Failed to mark reminder as read: {ack_error}")
+                    if processing_view_id:
+                        try:
+                            slack_service.update_modal_message(
+                                view_id=processing_view_id,
+                                title=f"既読エラー{settings.app_name_suffix}",
+                                message="既読処理でエラーが発生しました。時間をおいて再試行してください。",
+                                emoji="⚠️",
+                                close_text="閉じる",
+                            )
+                        except Exception as modal_error:
+                            print(f"⚠️ Failed to update error modal: {modal_error}")
 
             asyncio.create_task(run_mark_read())
             return JSONResponse(content={})
