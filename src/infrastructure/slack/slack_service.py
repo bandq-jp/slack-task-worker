@@ -1,7 +1,8 @@
+import asyncio
 import copy
 import json
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from src.domain.entities.task import TaskRequest
@@ -58,6 +59,87 @@ class SlackService:
             return ""
         else:
             return " (Dev)"
+
+    def build_loading_modal(
+        self,
+        *,
+        title: str,
+        message: str,
+        close_text: Optional[str] = "キャンセル",
+        external_id: Optional[str] = None,
+        private_metadata: Optional[Union[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Build a minimal loading modal payload for immediate ACKs."""
+        view_title = title[:24] if title else "Loading"
+        modal: Dict[str, Any] = {
+            "type": "modal",
+            "callback_id": "loading",
+            "title": {"type": "plain_text", "text": view_title},
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": message or "⏳ 読み込み中..."},
+                }
+            ],
+        }
+
+        if close_text:
+            modal["close"] = {"type": "plain_text", "text": close_text[:24]}
+
+        if external_id:
+            modal["external_id"] = external_id
+
+        if private_metadata is not None:
+            if isinstance(private_metadata, str):
+                modal["private_metadata"] = private_metadata
+            else:
+                modal["private_metadata"] = json.dumps(private_metadata)
+
+        return modal
+
+    async def open_loading_modal(
+        self,
+        *,
+        trigger_id: str,
+        title: str,
+        message: str,
+        close_text: Optional[str] = "キャンセル",
+        external_id: Optional[str] = None,
+        private_metadata: Optional[Union[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Open a loading modal synchronously and return the Slack response."""
+        view = self.build_loading_modal(
+            title=title,
+            message=message,
+            close_text=close_text,
+            external_id=external_id,
+            private_metadata=private_metadata,
+        )
+        response = self.client.views_open(trigger_id=trigger_id, view=view)
+        return response
+
+    async def update_modal_view(
+        self,
+        *,
+        view: Dict[str, Any],
+        view_id: Optional[str] = None,
+        external_id: Optional[str] = None,
+        hash: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update an existing modal by view_id or external_id."""
+        if not view_id and not external_id:
+            raise ValueError("Either view_id or external_id must be provided for views.update")
+
+        payload: Dict[str, Any] = {"view": view}
+        if view_id:
+            payload["view_id"] = view_id
+        if external_id:
+            payload["external_id"] = external_id
+        if hash:
+            payload["hash"] = hash
+
+        response = self.client.views_update(**payload)
+        return response
 
     def _format_datetime(self, value: datetime) -> str:
         if not value:
@@ -122,6 +204,99 @@ class SlackService:
             initial_option = options[0]
 
         return options, initial_option, len(internal_users), limit_hit
+
+    def build_task_creation_modal(
+        self,
+        *,
+        requester_id: str,
+        user_options: List[Dict[str, Any]],
+        private_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        metadata = {"requester_id": requester_id}
+        if private_metadata:
+            metadata.update(private_metadata)
+
+        return {
+            "type": "modal",
+            "callback_id": "create_task_modal",
+            "title": {"type": "plain_text", "text": f"タスク依頼作成{self.app_name_suffix}"},
+            "submit": {"type": "plain_text", "text": "作成"},
+            "close": {"type": "plain_text", "text": "キャンセル"},
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "assignee_block",
+                    "element": {
+                        "type": "static_select",
+                        "placeholder": {"type": "plain_text", "text": "依頼先を選択"},
+                        "options": user_options,
+                        "action_id": "assignee_select",
+                    },
+                    "label": {"type": "plain_text", "text": "依頼先"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "title_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "title_input",
+                        "placeholder": {"type": "plain_text", "text": "タスクの件名を入力"},
+                    },
+                    "label": {"type": "plain_text", "text": "件名"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "due_date_block",
+                    "element": {"type": "datetimepicker", "action_id": "due_date_picker"},
+                    "label": {"type": "plain_text", "text": "納期"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "task_type_block",
+                    "element": {
+                        "type": "static_select",
+                        "placeholder": {"type": "plain_text", "text": "タスク種類を選択"},
+                        "options": self._task_type_options(),
+                        "action_id": "task_type_select",
+                    },
+                    "label": {"type": "plain_text", "text": "タスク種類"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "urgency_block",
+                    "element": {
+                        "type": "static_select",
+                        "placeholder": {"type": "plain_text", "text": "緊急度を選択"},
+                        "options": self._urgency_options(),
+                        "action_id": "urgency_select",
+                    },
+                    "label": {"type": "plain_text", "text": "緊急度"},
+                },
+                {
+                    "type": "section",
+                    "block_id": "ai_helper_section",
+                    "text": {"type": "mrkdwn", "text": "🤖 *AI補完機能*\nタスクの詳細内容をAIに生成・改良してもらえます"},
+                    "accessory": {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "AI補完", "emoji": True},
+                        "value": "ai_enhance",
+                        "action_id": "ai_enhance_button",
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "description_block",
+                    "element": {
+                        "type": "rich_text_input",
+                        "action_id": "description_input",
+                        "placeholder": {"type": "plain_text", "text": "タスクの詳細を入力（任意）"},
+                    },
+                    "label": {"type": "plain_text", "text": "内容詳細"},
+                    "optional": True,
+                },
+            ],
+            "private_metadata": json.dumps(metadata),
+        }
 
     def _build_rich_text_initial(self, description: Optional[Any]) -> Optional[Dict[str, Any]]:
         if not description:
@@ -1001,6 +1176,62 @@ class SlackService:
         except SlackApiError as e:
             print(f"Error notifying extension rejection: {e}")
 
+    def build_completion_modal(
+        self,
+        snapshot,
+        stage: str,
+        requester_slack_id: str,
+        assignee_slack_id: str,
+    ) -> Dict[str, Any]:
+        """Build completion request modal payload."""
+        notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
+        now_jst = self._ensure_jst(datetime.now(JST))
+        due_jst = self._ensure_jst(snapshot.due_date) if getattr(snapshot, "due_date", None) else None
+        overdue = bool(due_jst and now_jst > due_jst)
+
+        note_label = "遅延理由（必須）" if overdue else "完了メモ（任意）"
+        note_placeholder = "遅延となった理由を記入してください" if overdue else "完了内容や共有事項を記入"
+
+        return {
+            "type": "modal",
+            "callback_id": "completion_request_modal",
+            "title": {"type": "plain_text", "text": "完了報告"},
+            "submit": {"type": "plain_text", "text": "送信"},
+            "close": {"type": "plain_text", "text": "キャンセル"},
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*{snapshot.title}*\n納期: {self._format_datetime(snapshot.due_date)}\n"
+                            f"状況: {REMINDER_STAGE_LABELS.get(stage, stage)}\n"
+                            f"完了日時は送信時刻（JST）に自動記録されます。\n"
+                            f"Notion: <{notion_url}|ページを開く>"
+                        ),
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "note_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "note_input",
+                        "multiline": True,
+                        "placeholder": {"type": "plain_text", "text": note_placeholder},
+                    },
+                    "label": {"type": "plain_text", "text": note_label},
+                    "optional": not overdue,
+                },
+            ],
+            "private_metadata": json.dumps({
+                "page_id": snapshot.page_id,
+                "requester_slack_id": requester_slack_id,
+                "assignee_slack_id": assignee_slack_id,
+                "require_reason": overdue,
+            }),
+        }
+
     async def open_completion_modal(
         self,
         trigger_id: str,
@@ -1011,54 +1242,12 @@ class SlackService:
     ):
         """完了報告モーダル"""
         try:
-            notion_url = f"https://www.notion.so/{snapshot.page_id.replace('-', '')}"
-            now_jst = self._ensure_jst(datetime.now(JST))
-            due_jst = self._ensure_jst(snapshot.due_date) if getattr(snapshot, "due_date", None) else None
-            overdue = bool(due_jst and now_jst > due_jst)
-
-            note_label = "遅延理由（必須）" if overdue else "完了メモ（任意）"
-            note_placeholder = "遅延となった理由を記入してください" if overdue else "完了内容や共有事項を記入"
-
-            modal = {
-                "type": "modal",
-                "callback_id": "completion_request_modal",
-                "title": {"type": "plain_text", "text": "完了報告"},
-                "submit": {"type": "plain_text", "text": "送信"},
-                "close": {"type": "plain_text", "text": "キャンセル"},
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"*{snapshot.title}*\n納期: {self._format_datetime(snapshot.due_date)}\n"
-                                f"状況: {REMINDER_STAGE_LABELS.get(stage, stage)}\n"
-                                f"完了日時は送信時刻（JST）に自動記録されます。\n"
-                                f"Notion: <{notion_url}|ページを開く>"
-                            ),
-                        },
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "note_block",
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "note_input",
-                            "multiline": True,
-                            "placeholder": {"type": "plain_text", "text": note_placeholder},
-                        },
-                        "label": {"type": "plain_text", "text": note_label},
-                        "optional": not overdue,
-                    },
-                ],
-                "private_metadata": json.dumps({
-                    "page_id": snapshot.page_id,
-                    "requester_slack_id": requester_slack_id,
-                    "assignee_slack_id": assignee_slack_id,
-                    "require_reason": overdue,
-                }),
-            }
-
+            modal = self.build_completion_modal(
+                snapshot=snapshot,
+                stage=stage,
+                requester_slack_id=requester_slack_id,
+                assignee_slack_id=assignee_slack_id,
+            )
             return self.client.views_open(trigger_id=trigger_id, view=modal)
         except SlackApiError as e:
             print(f"Error opening completion modal: {e}")
@@ -1487,118 +1676,47 @@ class SlackService:
             raise
 
     async def open_task_modal(self, trigger_id: str, user_id: str):
-        """タスク作成モーダルを開く"""
+        """タスク作成モーダルを開く（即時ローディング→バックグラウンド更新）"""
         try:
-            # まず最小のモーダルを即時に開く（3秒ルール回避）
-            loading_modal = {
-                "type": "modal",
-                "callback_id": "create_task_modal_loading",
-                "title": {"type": "plain_text", "text": f"タスク依頼作成{self.app_name_suffix}"},
-                "close": {"type": "plain_text", "text": "キャンセル"},
-                "blocks": [
-                    {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ 初期化中…"}}
-                ],
-                "private_metadata": json.dumps({"requester_id": user_id}),
-            }
+            response = await self.open_loading_modal(
+                trigger_id=trigger_id,
+                title=f"タスク依頼作成{self.app_name_suffix}",
+                message="⏳ 初期化中…",
+                private_metadata={"requester_id": user_id},
+            )
+            view = response.get("view", {})
+            view_id = view.get("id")
+            if not view_id:
+                raise SlackApiError(message="Missing view id in views.open response", response=response)
 
-            open_resp = self.client.views_open(trigger_id=trigger_id, view=loading_modal)
-            view_id = open_resp["view"]["id"]
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._hydrate_task_creation_modal(view_id=view_id, requester_id=user_id))
+            return response
+        except SlackApiError as e:
+            print(f"Error opening task modal: {e}")
+            raise
 
-            # ユーザーリストの取得（少し時間がかかる可能性があるため open 後に実行）
-            user_options, _, internal_count, limit_hit = self._get_user_select_options()
+    async def _hydrate_task_creation_modal(self, *, view_id: str, requester_id: str) -> None:
+        """Populate the task creation modal after the initial loading view."""
+        try:
+            loop = asyncio.get_running_loop()
+            user_options, _, internal_count, limit_hit = await loop.run_in_executor(
+                None, self._get_user_select_options
+            )
 
             print(f"📊 社内メンバー: {internal_count}人（表示: {min(internal_count, 100)}人）")
             if limit_hit:
                 print("⚠️ ユーザー数制限により100人のみ表示")
 
-            full_modal = {
-                "type": "modal",
-                "callback_id": "create_task_modal",
-                "title": {"type": "plain_text", "text": f"タスク依頼作成{self.app_name_suffix}"},
-                "submit": {"type": "plain_text", "text": "作成"},
-                "close": {"type": "plain_text", "text": "キャンセル"},
-                "blocks": [
-                    {
-                        "type": "input",
-                        "block_id": "assignee_block",
-                        "element": {
-                            "type": "static_select",
-                            "placeholder": {"type": "plain_text", "text": "依頼先を選択"},
-                            "options": user_options,
-                            "action_id": "assignee_select",
-                        },
-                        "label": {"type": "plain_text", "text": "依頼先"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "title_block",
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "title_input",
-                            "placeholder": {"type": "plain_text", "text": "タスクの件名を入力"},
-                        },
-                        "label": {"type": "plain_text", "text": "件名"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "due_date_block",
-                        "element": {"type": "datetimepicker", "action_id": "due_date_picker"},
-                        "label": {"type": "plain_text", "text": "納期"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "task_type_block",
-                        "element": {
-                            "type": "static_select",
-                            "placeholder": {"type": "plain_text", "text": "タスク種類を選択"},
-                            "options": self._task_type_options(),
-                            "action_id": "task_type_select",
-                        },
-                        "label": {"type": "plain_text", "text": "タスク種類"},
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "urgency_block",
-                        "element": {
-                            "type": "static_select",
-                            "placeholder": {"type": "plain_text", "text": "緊急度を選択"},
-                            "options": self._urgency_options(),
-                            "action_id": "urgency_select",
-                        },
-                        "label": {"type": "plain_text", "text": "緊急度"},
-                    },
-                    {
-                        "type": "section",
-                        "block_id": "ai_helper_section",
-                        "text": {"type": "mrkdwn", "text": "🤖 *AI補完機能*\nタスクの詳細内容をAIに生成・改良してもらえます"},
-                        "accessory": {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "AI補完", "emoji": True},
-                            "value": "ai_enhance",
-                            "action_id": "ai_enhance_button",
-                        },
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "description_block",
-                        "element": {
-                            "type": "rich_text_input",
-                            "action_id": "description_input",
-                            "placeholder": {"type": "plain_text", "text": "タスクの詳細を入力（任意）"},
-                        },
-                        "label": {"type": "plain_text", "text": "内容詳細"},
-                        "optional": True,
-                    },
-                ],
-                "private_metadata": json.dumps({"requester_id": user_id}),
-            }
-
-            # ローディングビューから本ビューへ更新
-            self.client.views_update(view_id=view_id, view=full_modal)
-
-        except SlackApiError as e:
-            print(f"Error opening modal: {e}")
-            raise
+            modal = self.build_task_creation_modal(
+                requester_id=requester_id,
+                user_options=user_options,
+            )
+            await self.update_modal_view(view=modal, view_id=view_id)
+        except SlackApiError as error:
+            print(f"⚠️ Failed to hydrate task creation modal: {error}")
+        except Exception as exc:
+            print(f"⚠️ Unexpected error hydrating task modal: {exc}")
 
     async def open_task_revision_modal(
         self,

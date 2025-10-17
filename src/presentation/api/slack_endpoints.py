@@ -1,7 +1,8 @@
 import json
+import asyncio
 from datetime import datetime, timezone
 from fastapi import APIRouter, Request, HTTPException, Form, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from typing import Dict, Any, Optional, List
 from src.application.services.task_service import TaskApplicationService
 from src.application.dto.task_dto import CreateTaskRequestDto, TaskApprovalDto, ReviseTaskRequestDto
@@ -41,6 +42,9 @@ from src.presentation.api.slack.actions import (
     handle_completion_approval_action,
 )
 from zoneinfo import ZoneInfo
+from src.presentation.api.slack.security import verify_slack_signature
+from src.infrastructure.slack.modal_registry import ModalRegistry
+from slack_sdk.errors import SlackApiError
 
 
 router = APIRouter(prefix="/slack", tags=["slack"])
@@ -63,6 +67,7 @@ ai_service = dependencies.ai_service
 task_concurrency = dependencies.task_concurrency
 
 modal_sessions = {}
+modal_registry = ModalRegistry()
 
 print("🚀 Slack-Notion Task Management System initialized!")
 print(f"🌍 Environment: {settings.env}")
@@ -362,16 +367,32 @@ async def run_reminders():
 @router.post("/commands")
 async def handle_slash_command(request: Request):
     """スラッシュコマンドのハンドラー"""
+    await verify_slack_signature(request, settings.slack_signing_secret)
     form = await request.form()
     command = form.get("command")
     trigger_id = form.get("trigger_id")
     user_id = form.get("user_id")
 
     if command == settings.slack_command_name:
-        # タスク作成モーダルを開く（即時ACK + バックグラウンドで続行）
-        import asyncio
-        asyncio.create_task(slack_service.open_task_modal(trigger_id, user_id))
-        return JSONResponse(content={"response_type": "ephemeral", "text": ""})
+        try:
+            await slack_service.open_task_modal(trigger_id, user_id)
+        except SlackApiError as error:
+            error_code = None
+            try:
+                error_code = error.response.get("error")
+            except Exception:
+                error_code = None
+            print(f"⚠️ Failed to open task modal: {error}")
+            if error_code == "expired_trigger_id":
+                try:
+                    dm = slack_service.client.conversations_open(users=user_id)
+                    slack_service.client.chat_postMessage(
+                        channel=dm["channel"]["id"],
+                        text="モーダルの初期化がタイムアウトしました。もう一度コマンドを実行してください。",
+                    )
+                except Exception as dm_error:
+                    print(f"⚠️ Failed to send trigger expiry notice: {dm_error}")
+        return Response(status_code=200)
 
     return JSONResponse(
         content={"response_type": "ephemeral", "text": "Unknown command"}
@@ -381,6 +402,7 @@ async def handle_slash_command(request: Request):
 @router.post("/interactive")
 async def handle_interactive(request: Request):
     """インタラクティブコンポーネント（ボタン、モーダル）のハンドラー"""
+    await verify_slack_signature(request, settings.slack_signing_secret)
     form = await request.form()
     payload = json.loads(form.get("payload", "{}"))
 
@@ -491,8 +513,6 @@ async def handle_interactive(request: Request):
                 return JSONResponse(content={})
 
             page_id = value_data.get("page_id")
-
-            import asyncio
 
             async def run_delete():
                 try:
@@ -624,9 +644,6 @@ async def handle_interactive(request: Request):
                     }
                 ]
             }
-
-            import asyncio
-
             async def run_delete():
                 try:
                     # タスクスナップショット取得
@@ -753,9 +770,6 @@ async def handle_interactive(request: Request):
             message = payload.get("message", {})
             message_ts = message.get("ts")
             message_blocks = message.get("blocks", [])
-
-            import asyncio
-
             async def run_mark_read():
                 if not page_id:
                     try:
@@ -861,59 +875,123 @@ async def handle_interactive(request: Request):
                 return JSONResponse(content={})
 
             page_id = value_data.get("page_id")
-            stage = value_data.get("stage")
+            stage = value_data.get("stage") or "unknown"
             requester_slack_id = value_data.get("requester_slack_id")
 
-            snapshot = await notion_service.get_task_snapshot(page_id)
-            if not snapshot:
-                try:
-                    dm = slack_service.client.conversations_open(users=user_id)
-                    slack_service.client.chat_postMessage(
-                        channel=dm["channel"]["id"],
-                        text="Notionのタスク情報を取得できませんでした。しばらくして再試行してください。",
-                    )
-                except Exception as dm_error:
-                    print(f"⚠️ Failed to notify user about missing snapshot: {dm_error}")
+            if not page_id:
+                print("⚠️ Missing page_id for completion modal")
                 return JSONResponse(content={})
 
-            if not requester_slack_id and snapshot.requester_email:
-                try:
-                    requester_user = await slack_user_repository.find_by_email(Email(snapshot.requester_email))
-                    if requester_user:
-                        requester_slack_id = str(requester_user.user_id)
-                except Exception as lookup_error:
-                    print(f"⚠️ Failed to lookup requester Slack ID for completion modal: {lookup_error}")
-
-            if not requester_slack_id:
-                try:
-                    dm = slack_service.client.conversations_open(users=user_id)
-                    slack_service.client.chat_postMessage(
-                        channel=dm["channel"]["id"],
-                        text="依頼者のSlackアカウントが見つかりません。管理者にお問い合わせください。",
-                    )
-                except Exception as dm_error:
-                    print(f"⚠️ Failed to notify user about missing requester Slack ID: {dm_error}")
-                return JSONResponse(content={})
-
+            external_id = f"completion_modal:{page_id}:{user_id}"
             try:
-                await slack_service.open_completion_modal(
+                open_response = await slack_service.open_loading_modal(
                     trigger_id=trigger_id,
-                    snapshot=snapshot,
-                    stage=stage,
-                    requester_slack_id=requester_slack_id,
-                    assignee_slack_id=user_id,
+                    title="完了報告",
+                    message="⏳ モーダルを準備しています…",
+                    external_id=external_id,
+                    private_metadata={"page_id": page_id, "requester_slack_id": requester_slack_id or "", "assignee_slack_id": user_id},
                 )
-            except Exception as open_err:
-                print(f"⚠️ Failed to open completion modal: {open_err}")
-                # trigger_idの有効期限切れ等。ユーザーに再試行を促す
+            except SlackApiError as open_error:
+                print(f"⚠️ Failed to open loading modal for completion: {open_error}")
                 try:
                     dm = slack_service.client.conversations_open(users=user_id)
                     slack_service.client.chat_postMessage(
                         channel=dm["channel"]["id"],
-                        text="モーダルを開けませんでした（数秒で失効するため）。もう一度ボタンを押してください。",
+                        text="モーダルを開けませんでした。数秒後にもう一度お試しください。",
                     )
                 except Exception as dm_error:
-                    print(f"⚠️ Failed to DM about modal open failure: {dm_error}")
+                    print(f"⚠️ Failed to DM about loading modal failure: {dm_error}")
+                return JSONResponse(content={})
+
+            view = open_response.get("view", {})
+            view_id = view.get("id")
+            view_hash = view.get("hash")
+            if not view_id:
+                print("⚠️ Slack response missing view_id for completion modal")
+                return JSONResponse(content={})
+
+            await modal_registry.put(
+                external_id,
+                view_id=view_id,
+                hash=view_hash,
+                page_id=page_id,
+                user_id=user_id,
+                stage=stage,
+            )
+
+            async def hydrate_completion_modal() -> None:
+                try:
+                    snapshot = await notion_service.get_task_snapshot(page_id)
+                    if not snapshot:
+                        await slack_service.update_modal_view(
+                            view={
+                                "type": "modal",
+                                "title": {"type": "plain_text", "text": "完了報告"},
+                                "close": {"type": "plain_text", "text": "閉じる"},
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {"type": "mrkdwn", "text": "⚠️ タスク情報を取得できませんでした。時間をおいて再試行してください。"},
+                                    }
+                                ],
+                            },
+                            view_id=view_id,
+                            hash=view_hash,
+                        )
+                        return
+
+                    requester_id = requester_slack_id
+                    if not requester_id and snapshot.requester_email:
+                        try:
+                            requester_user = await slack_user_repository.find_by_email(Email(snapshot.requester_email))
+                            if requester_user:
+                                requester_id = str(requester_user.user_id)
+                        except Exception as lookup_error:
+                            print(f"⚠️ Failed to lookup requester Slack ID for completion modal: {lookup_error}")
+
+                    if not requester_id:
+                        await slack_service.update_modal_view(
+                            view={
+                                "type": "modal",
+                                "title": {"type": "plain_text", "text": "完了報告"},
+                                "close": {"type": "plain_text", "text": "閉じる"},
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {"type": "mrkdwn", "text": "⚠️ 依頼者のSlackアカウントを解決できませんでした。管理者にお問い合わせください。"},
+                                    }
+                                ],
+                            },
+                            view_id=view_id,
+                            hash=view_hash,
+                        )
+                        return
+
+                    modal_view = slack_service.build_completion_modal(
+                        snapshot=snapshot,
+                        stage=stage,
+                        requester_slack_id=requester_id,
+                        assignee_slack_id=user_id,
+                    )
+                    await slack_service.update_modal_view(
+                        view=modal_view,
+                        view_id=view_id,
+                        hash=view_hash,
+                    )
+                except SlackApiError as hydration_error:
+                    print(f"⚠️ Failed to hydrate completion modal: {hydration_error}")
+                    try:
+                        dm = slack_service.client.conversations_open(users=user_id)
+                        slack_service.client.chat_postMessage(
+                            channel=dm["channel"]["id"],
+                            text="モーダルの更新に失敗しました。再度ボタンを押してやり直してください。",
+                        )
+                    except Exception as dm_error:
+                        print(f"⚠️ Failed to DM about hydration failure: {dm_error}")
+                except Exception as exc:
+                    print(f"⚠️ Unexpected error while hydrating completion modal: {exc}")
+
+            asyncio.create_task(hydrate_completion_modal())
             return JSONResponse(content={})
 
         elif action_id == "approve_completion_request":
@@ -1081,10 +1159,7 @@ async def handle_interactive(request: Request):
                         }
                     ]
                 }
-
                 # 2) バックグラウンドでタスク作成処理を実行
-                import asyncio
-                
                 async def run_task_creation():
                     try:
                         print("🔄 バックグラウンドタスク作成開始...")
@@ -1235,9 +1310,6 @@ async def handle_interactive(request: Request):
 
             source_channel = private_metadata.get("source_channel")
             source_ts = private_metadata.get("source_ts")
-
-            import asyncio
-
             async def run_task_revision():
                 try:
                     response = await task_service.revise_task_request(dto)
@@ -1354,8 +1426,6 @@ async def handle_interactive(request: Request):
                 }
                 
                 # バックグラウンドで差し戻し処理を実行
-                import asyncio
-                
                 async def run_rejection():
                     try:
                         dto = TaskApprovalDto(
@@ -1552,9 +1622,6 @@ async def handle_interactive(request: Request):
                     }
                 ]
             }
-
-            import asyncio
-
             async def run_completion_request():
                 requested_at = datetime.now(JST)
                 try:
@@ -1710,9 +1777,6 @@ async def handle_interactive(request: Request):
                     }
                 ]
             }
-
-            import asyncio
-
             async def run_completion_rejection():
                 try:
                     snapshot = await notion_service.get_task_snapshot(page_id)
@@ -2120,9 +2184,7 @@ async def handle_ai_enhancement_async(payload: dict, trigger_id: str, view_id: O
         print("🔍 処理中ビュー作成中...")
         processing_view = create_processing_view(session_id, title="AI補完 - 実行中", description="AIが内容を整理中です… しばらくお待ちください。")
         print("✅ 処理中ビュー作成完了")
-
         # 非同期でGemini処理 → 結果に応じてviews.update
-        import asyncio
         print("🔍 非同期AI処理開始準備中...")
 
         async def run_analysis_and_update():
@@ -2243,9 +2305,7 @@ async def handle_additional_info_submission(payload: dict) -> JSONResponse:
 
         # 即時ACK: 処理中ビュー
         processing_view = create_processing_view(session_id, title="AI補完 - 再分析中", description="いただいた情報で再分析しています…")
-
         # 背景でAI改良→views.update
-        import asyncio
 
         async def run_refine_and_update():
             try:
@@ -2321,9 +2381,6 @@ async def handle_content_confirmation(payload: dict) -> JSONResponse:
         
         # 即時ACK: 処理中ビュー
         processing_view = create_processing_view(session_id, title="AI補完 - 反映中", description="内容を反映しています…")
-
-        import asyncio
-
         async def run_feedback_apply():
             try:
                 if feedback:
