@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     google_application_credentials: str = ""
     service_account_json: str = ""
     env: str = "local"
+    task_metrics_enabled: bool = False
     task_event_notification_emails_raw: Optional[Union[str, List[str]]] = Field(
         default=None,
         alias="task_event_notification_emails",

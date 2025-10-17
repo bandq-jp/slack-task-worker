@@ -1,12 +1,39 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 from src.domain.entities.task_metrics import TaskMetricsRecord
 from src.domain.services.task_metrics_domain_service import TaskMetricsDomainService
 from src.infrastructure.notion.admin_metrics_service import AdminMetricsNotionService
 from src.infrastructure.notion.dynamic_notion_service import NotionTaskSnapshot
+
+
+class _DisabledAdminMetricsService:
+    """No-op replacement for AdminMetricsNotionService when metrics更新を無効化する場合に使用。"""
+
+    async def get_metrics_by_task_id(self, task_page_id: str) -> Optional[TaskMetricsRecord]:
+        return None
+
+    async def upsert_task_metrics(self, record: TaskMetricsRecord) -> TaskMetricsRecord:
+        return record
+
+    async def update_overdue_points(self, task_page_id: str, points: int) -> Optional[TaskMetricsRecord]:
+        return None
+
+    async def update_reminder_stage(
+        self,
+        task_page_id: str,
+        stage: Optional[str],
+        timestamp: datetime,
+    ) -> Optional[TaskMetricsRecord]:
+        return None
+
+    async def fetch_all_metrics(self) -> Sequence[TaskMetricsRecord]:
+        return ()
+
+    async def upsert_assignee_summaries(self, summaries: Sequence) -> None:
+        return None
 
 
 class TaskMetricsApplicationService:
@@ -16,14 +43,22 @@ class TaskMetricsApplicationService:
         self,
         admin_metrics_service: AdminMetricsNotionService,
         domain_service: Optional[TaskMetricsDomainService] = None,
+        *,
+        enabled: bool = True,
     ) -> None:
-        self.admin_metrics_service = admin_metrics_service
+        self.enabled = enabled
+        self._real_admin_metrics_service = admin_metrics_service
+        self.admin_metrics_service = (
+            admin_metrics_service if enabled else _DisabledAdminMetricsService()
+        )
         self.domain_service = domain_service or TaskMetricsDomainService()
 
     async def ensure_metrics_for_snapshots(
         self,
         snapshots: Iterable[NotionTaskSnapshot],
     ) -> Dict[str, TaskMetricsRecord]:
+        if not self.enabled:
+            return {}
         metrics: Dict[str, TaskMetricsRecord] = {}
         for snapshot in snapshots:
             record = await self.sync_snapshot(snapshot)
@@ -52,7 +87,9 @@ class TaskMetricsApplicationService:
             extension_status=snapshot.extension_status,
         )
 
-        existing = await self.admin_metrics_service.get_metrics_by_task_id(snapshot.page_id)
+        existing: Optional[TaskMetricsRecord] = None
+        if self.enabled:
+            existing = await self.admin_metrics_service.get_metrics_by_task_id(snapshot.page_id)
         if existing:
             record.metrics_page_id = existing.metrics_page_id
             record.assignee_name = existing.assignee_name
@@ -79,9 +116,14 @@ class TaskMetricsApplicationService:
             if due_utc and due_utc > now_utc:
                 record.overdue_points = 0
 
+        if not self.enabled:
+            return record
+
         return await self.admin_metrics_service.upsert_task_metrics(record)
 
     async def update_overdue_points(self, task_page_id: str, points: int) -> Optional[TaskMetricsRecord]:
+        if not self.enabled:
+            return None
         return await self.admin_metrics_service.update_overdue_points(task_page_id, points)
 
     async def update_reminder_stage(
@@ -90,9 +132,13 @@ class TaskMetricsApplicationService:
         stage: Optional[str],
         timestamp: datetime,
     ) -> Optional[TaskMetricsRecord]:
+        if not self.enabled:
+            return None
         return await self.admin_metrics_service.update_reminder_stage(task_page_id, stage, timestamp)
 
     async def refresh_assignee_summaries(self) -> None:
+        if not self.enabled:
+            return None
         metrics = await self.admin_metrics_service.fetch_all_metrics()
         print(f"📈 Metrics fetched for summary: {len(metrics)} 件")
         summaries = self.domain_service.build_assignee_summaries(metrics, datetime.now(timezone.utc))

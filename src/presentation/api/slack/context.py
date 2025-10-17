@@ -82,7 +82,10 @@ def build_slack_dependencies() -> SlackDependencies:
         metrics_database_id=settings.notion_metrics_database_id,
         summary_database_id=settings.notion_assignee_summary_database_id,
     )
-    task_metrics_service = TaskMetricsApplicationService(admin_metrics_service=admin_metrics_service)
+    task_metrics_service = TaskMetricsApplicationService(
+        admin_metrics_service=admin_metrics_service,
+        enabled=settings.task_metrics_enabled,
+    )
 
     ai_service = (
         TaskAIService(
