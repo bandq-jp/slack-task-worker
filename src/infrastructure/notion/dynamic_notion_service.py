@@ -139,6 +139,90 @@ class DynamicNotionService:
         """データベースIDを正規化（ハイフンを削除）"""
         return database_id.replace("-", "")
 
+    def _is_in_trash(self, obj: Dict[str, Any]) -> bool:
+        """Return whether a Notion object is trashed across old/new API fields."""
+        if "in_trash" in obj:
+            return bool(obj.get("in_trash"))
+        return bool(obj.get("archived"))
+
+    def _notion_object_name(self, obj: Dict[str, Any]) -> str:
+        object_type = obj.get("object")
+
+        if object_type == "database":
+            return "".join(item.get("plain_text", "") for item in obj.get("title", []))
+
+        if object_type == "page":
+            for prop in obj.get("properties", {}).values():
+                if prop.get("type") == "title":
+                    return "".join(item.get("plain_text", "") for item in prop.get("title", []))
+
+        if object_type == "block":
+            block_type = obj.get("type")
+            block_payload = obj.get(block_type, {}) if block_type else {}
+            title = block_payload.get("title")
+            if title:
+                return title
+            rich_text = block_payload.get("rich_text")
+            if rich_text:
+                return "".join(item.get("plain_text", "") for item in rich_text)
+            return block_type or "block"
+
+        return object_type or "unknown"
+
+    def _assert_not_in_trash(self, obj: Dict[str, Any], context: str) -> None:
+        if not self._is_in_trash(obj):
+            return
+
+        object_id = obj.get("id", "unknown")
+        object_type = obj.get("object", "object")
+        object_name = self._notion_object_name(obj) or "(no title)"
+        raise ValueError(
+            f"Notion {object_type} is in trash: {object_name} ({object_id}). "
+            f"Restore it before {context}."
+        )
+
+    def _assert_parent_chain_not_in_trash(self, parent: Optional[Dict[str, Any]], context: str) -> None:
+        seen: set[str] = set()
+
+        while parent:
+            parent_type = parent.get("type")
+            object_id = (
+                parent.get("database_id")
+                or parent.get("page_id")
+                or parent.get("block_id")
+            )
+
+            if not object_id or object_id in seen:
+                return
+
+            seen.add(object_id)
+
+            try:
+                if parent_type == "database_id":
+                    obj = self.client.databases.retrieve(database_id=object_id)
+                elif parent_type == "page_id":
+                    obj = self.client.pages.retrieve(page_id=object_id)
+                elif parent_type == "block_id":
+                    obj = self.client.blocks.retrieve(block_id=object_id)
+                else:
+                    return
+            except Exception as exc:
+                print(f"⚠️ Failed to verify Notion ancestor {object_id}: {exc}")
+                return
+
+            self._assert_not_in_trash(obj, context)
+            parent = obj.get("parent")
+
+    def _ensure_database_editable(self) -> None:
+        database = self.client.databases.retrieve(database_id=self.database_id)
+        self._assert_not_in_trash(database, "creating tasks")
+        self._assert_parent_chain_not_in_trash(database.get("parent"), "creating tasks")
+
+    def _ensure_page_editable(self, page_id: str, context: str) -> None:
+        page = self.client.pages.retrieve(page_id=page_id)
+        self._assert_not_in_trash(page, context)
+        self._assert_parent_chain_not_in_trash(page.get("parent"), context)
+
     def _parse_datetime(self, date_payload: Optional[Dict[str, Any]]) -> Optional[datetime]:
         if not date_payload:
             return None
@@ -467,6 +551,8 @@ class DynamicNotionService:
             print(f"   task_type: '{task.task_type}'")
             print(f"   urgency: '{task.urgency}'")
 
+            self._ensure_database_editable()
+
             # 新しいアプリケーションサービスでユーザー検索
             requester_user, assignee_user = await self.user_mapping_service.get_notion_user_for_task_creation(
                 requester_email, 
@@ -683,6 +769,9 @@ class DynamicNotionService:
             print(f"Database ID: {self.database_id}")
             description_preview = convert_rich_text_to_plain_text(task.description)
             print(f"Task details: title='{task.title}', description='{description_preview[:100]}...'")
+
+            if "is in trash" in str(e):
+                raise
 
             # 権限エラーの場合の詳細メッセージ
             if "shared with your integration" in str(e):
@@ -1501,6 +1590,8 @@ class DynamicNotionService:
     ):
         """タスクのステータスを更新"""
         try:
+            self._ensure_page_editable(page_id, "updating task status")
+
             properties = {
                 "ステータス": {
                     "select": {
